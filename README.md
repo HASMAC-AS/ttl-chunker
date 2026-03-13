@@ -1,6 +1,6 @@
 # ttl-chunker
 
-Chunks a turtle file into smaller files.
+Splits a Turtle file into smaller Turtle files.
 
 ## Prerequisites
 
@@ -22,38 +22,41 @@ Compile the project and package it into a JAR file:
 mvn package
 ```
 
-The compiled JAR will be placed in the `target/` directory.
+Jar: `target/ttl-chunker-1.0-SNAPSHOT.jar`
 
 ## Running
 
-### Using the Maven exec plugin
+```bash
+java -jar target/ttl-chunker-1.0-SNAPSHOT.jar input.ttl 128MB
+```
+
+Optional output dir:
 
 ```bash
-mvn exec:java -Dexec.mainClass="no.hasmac.ttlchunker.HelloWorld"
+java -jar target/ttl-chunker-1.0-SNAPSHOT.jar input.ttl 128MB ./chunks
 ```
 
-### Using the packaged JAR
+Chunk size accepts:
 
-After building, run the JAR directly:
+- raw bytes: `50000000`
+- binary-ish suffixes: `64KB`, `128MB`, `2GB`
 
-```bash
-java -jar target/ttl-chunker-1.0-SNAPSHOT.jar
-```
+Behavior:
 
-Expected output:
+- splits on Turtle statement/directive boundaries
+- keeps chunk size approximate, not exact
+- prepends every chunk with all `@prefix` / `@base` directives seen so far
+- default output dir: `<input-name>-chunks/`
 
-```
-Hello, World!
-```
-
-## Project structure
+## Project Structure
 
 ```
 ttl-chunker/
 ├── pom.xml                                          # Maven build descriptor
 └── src/
-    └── main/
-        └── java/
-            └── no/hasmac/ttlchunker/
-                └── HelloWorld.java                  # Main entry point
+    ├── main/java/no/hasmac/ttlchunker/
+    │   ├── TurtleBlockReader.java                   # Streaming Turtle block reader
+    │   └── TurtleChunker.java                       # CLI + chunk writer
+    └── test/java/no/hasmac/ttlchunker/
+        └── TurtleChunkerTest.java                   # Regression coverage
 ```

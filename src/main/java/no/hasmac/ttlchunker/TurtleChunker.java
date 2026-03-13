@@ -1,16 +1,20 @@
 package no.hasmac.ttlchunker;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedWriter;
 import java.io.ByteArrayOutputStream;
-import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.Iterator;
+import java.util.Locale;
 import java.util.NoSuchElementException;
 import java.util.function.Consumer;
 
@@ -127,28 +131,28 @@ public class TurtleChunker {
 				return null; // truly no more
 			}
 			switch (state) {
-			case DEFAULT -> parseDefaultOneStep();
-			case PERIOD_PENDING -> parsePeriodOneStep();
-			case IRI -> parseIriOneStep();
-			case LITERAL -> parseLiteralOneStep();
-			case MULTILINE_LITERAL -> parseMultilineLiteralOneStep();
-			case LANG_TAG_OR_DATATYPE -> parseLangTagOrDatatypeOneStep();
-			case PREFIX_OR_BASE -> parsePrefixOrBaseOneStep();
-			case CONSUME_WHITESPACE -> {
-				// This state is not used in the current implementation.
-				// It can be used to handle whitespace between tokens.
-				// For now, we just skip it.
-				if (Character.isWhitespace(chunkBuf[bufPos])) {
-					chunkStart++;
-					bufPos++;
-				} else {
-					// If we encounter a non-whitespace character, we need to
-					// handle it.
-					// We can either transition to the DEFAULT state or handle
-					// it as a special case.
-					state = State.DEFAULT;
+				case DEFAULT -> parseDefaultOneStep();
+				case PERIOD_PENDING -> parsePeriodOneStep();
+				case IRI -> parseIriOneStep();
+				case LITERAL -> parseLiteralOneStep();
+				case MULTILINE_LITERAL -> parseMultilineLiteralOneStep();
+				case LANG_TAG_OR_DATATYPE -> parseLangTagOrDatatypeOneStep();
+				case PREFIX_OR_BASE -> parsePrefixOrBaseOneStep();
+				case CONSUME_WHITESPACE -> {
+					// This state is not used in the current implementation.
+					// It can be used to handle whitespace between tokens.
+					// For now, we just skip it.
+					if (Character.isWhitespace(chunkBuf[bufPos])) {
+						chunkStart++;
+						bufPos++;
+					} else {
+						// If we encounter a non-whitespace character, we need to
+						// handle it.
+						// We can either transition to the DEFAULT state or handle
+						// it as a special case.
+						state = State.DEFAULT;
+					}
 				}
-			}
 			}
 			if (finishedOneBlock != null) {
 				String block = finishedOneBlock;
@@ -541,7 +545,9 @@ public class TurtleChunker {
 				try {
 					nextBlock = parseNextBlock();
 					if (prefixOrBase) {
-						this.prefixConsumer.accept(nextBlock);
+						if (this.prefixConsumer != null) {
+							this.prefixConsumer.accept(nextBlock);
+						}
 						prefixOrBase = false;
 						nextBlock = null;
 					} else {
@@ -571,48 +577,171 @@ public class TurtleChunker {
 		}
 	}
 
-	// -- Example main for testing --
 	public static void main(String[] args) {
-		String filePath = ""; // Update
-																												// path
-		long actualStart = System.currentTimeMillis();
-		long start = System.currentTimeMillis();
-		long count = 0;
-		long total = 0;
+		if (args.length < 2 || args.length > 3) {
+			printUsage();
+			System.exit(1);
+			return;
+		}
 
-		try (InputStream sr = new FileInputStream(filePath)) {
-			TurtleChunker tokenizer = new TurtleChunker(sr);
-			BlockIterator it = tokenizer.blockIterator();
+		Path inputFile = Path.of(args[0]);
+		long chunkSizeBytes;
+		try {
+			chunkSizeBytes = parseChunkSize(args[1]);
+		} catch (IllegalArgumentException e) {
+			System.err.println("Invalid chunk size: " + e.getMessage());
+			printUsage();
+			System.exit(1);
+			return;
+		}
 
-			System.out.println("Processing with NIO AsynchronousFileChannel (blocking wait)...");
+		Path outputDir = args.length == 3 ? Path.of(args[2]) : defaultOutputDir(inputFile);
 
-			it.setPrefixConsumer(p -> System.out.println("Prefix: " + p));
-
-			while (it.hasNext()) {
-				String block = it.next();
-				int length = block.trim().split("\n").length;
-				count += length;
-				total += length;
-				if (count > 10_000_000) {
-					System.out.println(count + " lines parsed");
-					System.out.println(block);
-					System.out.printf("Lines per second: %,d \n", count * 1000 / (System.currentTimeMillis() - start));
-					System.out.printf("Lines per second (total): %,d \n",
-							total * 1000 / (System.currentTimeMillis() - actualStart));
-
-					start = System.currentTimeMillis();
-					count = 0;
-				}
+		try {
+			int chunkCount = writeChunks(inputFile, chunkSizeBytes, outputDir);
+			if (chunkCount == 0) {
+				System.out.println("No Turtle statements found; no chunk files written.");
 			}
 		} catch (IOException e) {
-			e.printStackTrace();
-		} finally {
-			long actualEnd = System.currentTimeMillis();
-			long total2 = actualEnd - actualStart;
-			long minutes = total2 / 60000;
-			long seconds = (total2 % 60000) / 1000;
-			System.out.printf("Total: %,d \n", total);
-			System.out.printf("Total time: %d:%02d%n", minutes, seconds);
+			System.err.println("Chunking failed: " + e.getMessage());
+			System.exit(1);
 		}
+	}
+
+	static int writeChunks(Path inputFile, long approximateChunkSizeBytes, Path outputDir) throws IOException {
+		if (approximateChunkSizeBytes <= 0) {
+			throw new IllegalArgumentException("Chunk size must be greater than zero");
+		}
+		if (!Files.isRegularFile(inputFile)) {
+			throw new IOException("Input file not found: " + inputFile);
+		}
+
+		Files.createDirectories(outputDir);
+
+		StringBuilder prefixes = new StringBuilder();
+		int chunkIndex = 0;
+		long statements = 0;
+		BufferedWriter currentWriter = null;
+		long currentChunkBytes = 0;
+
+		try (InputStream inputStream = new BufferedInputStream(Files.newInputStream(inputFile))) {
+			TurtleChunker chunker = new TurtleChunker(inputStream);
+			BlockIterator iterator = chunker.blockIterator();
+			iterator.setPrefixConsumer(prefix -> {
+				String normalizedPrefix = prefix.strip();
+				if (!normalizedPrefix.isEmpty()) {
+					prefixes.append(normalizedPrefix).append('\n');
+				}
+			});
+
+			while (iterator.hasNext()) {
+				String block = iterator.next().strip();
+				if (block.isEmpty()) {
+					continue;
+				}
+
+				if (currentWriter == null) {
+					chunkIndex++;
+					Path chunkPath = outputDir.resolve(formatChunkFileName(chunkIndex));
+					currentWriter = Files.newBufferedWriter(chunkPath, StandardCharsets.UTF_8);
+					currentChunkBytes = writeChunkHeader(currentWriter, prefixes.toString());
+				}
+
+				String blockWithNewline = block + '\n';
+				currentWriter.write(blockWithNewline);
+				currentChunkBytes += utf8Size(blockWithNewline);
+				statements++;
+
+				if (currentChunkBytes > approximateChunkSizeBytes) {
+					currentWriter.close();
+					currentWriter = null;
+					currentChunkBytes = 0;
+				}
+			}
+		} finally {
+			if (currentWriter != null) {
+				currentWriter.close();
+			}
+		}
+
+		System.out.printf("Wrote %,d statements into %d chunk file(s): %s%n", statements, chunkIndex,
+				outputDir.toAbsolutePath());
+		return chunkIndex;
+	}
+
+	static long parseChunkSize(String rawValue) {
+		if (rawValue == null || rawValue.isBlank()) {
+			throw new IllegalArgumentException("Size is empty");
+		}
+
+		String value = rawValue.trim();
+		int suffixStart = 0;
+		while (suffixStart < value.length() && Character.isDigit(value.charAt(suffixStart))) {
+			suffixStart++;
+		}
+
+		if (suffixStart == 0) {
+			throw new IllegalArgumentException("Missing numeric size");
+		}
+
+		String numberPart = value.substring(0, suffixStart);
+		String suffix = value.substring(suffixStart).trim().toUpperCase(Locale.ROOT);
+		long numeric;
+		try {
+			numeric = Long.parseLong(numberPart);
+		} catch (NumberFormatException e) {
+			throw new IllegalArgumentException("Invalid numeric size: " + numberPart, e);
+		}
+
+		if (numeric <= 0) {
+			throw new IllegalArgumentException("Chunk size must be greater than zero");
+		}
+
+		long multiplier = switch (suffix) {
+			case "", "B" -> 1L;
+			case "K", "KB" -> 1024L;
+			case "M", "MB" -> 1024L * 1024L;
+			case "G", "GB" -> 1024L * 1024L * 1024L;
+			default -> throw new IllegalArgumentException("Unsupported size suffix: " + suffix);
+		};
+
+		try {
+			return Math.multiplyExact(numeric, multiplier);
+		} catch (ArithmeticException e) {
+			throw new IllegalArgumentException("Chunk size is too large: " + rawValue, e);
+		}
+	}
+
+	private static Path defaultOutputDir(Path inputFile) {
+		Path fileNamePath = inputFile.getFileName();
+		String fileName = fileNamePath == null ? inputFile.toString() : fileNamePath.toString();
+		int dotIndex = fileName.lastIndexOf('.');
+		String baseName = dotIndex > 0 ? fileName.substring(0, dotIndex) : fileName;
+		if (baseName.isBlank()) {
+			baseName = "ttl";
+		}
+		return Path.of(baseName + "-chunks");
+	}
+
+	private static String formatChunkFileName(int chunkIndex) {
+		return String.format("chunk-%05d.ttl", chunkIndex);
+	}
+
+	private static long writeChunkHeader(BufferedWriter writer, String prefixes) throws IOException {
+		if (prefixes.isBlank()) {
+			return 0;
+		}
+		String header = prefixes.stripTrailing() + "\n\n";
+		writer.write(header);
+		return utf8Size(header);
+	}
+
+	private static long utf8Size(String text) {
+		return text.getBytes(StandardCharsets.UTF_8).length;
+	}
+
+	private static void printUsage() {
+		System.err.println("Usage: java -jar target/ttl-chunker-1.0-SNAPSHOT.jar <input.ttl> <chunk-size> [output-dir]");
+		System.err.println("Chunk size examples: 50000000, 64KB, 128MB, 2GB");
 	}
 }

@@ -1,135 +1,91 @@
 package no.hasmac.ttlchunker;
 
 import java.io.BufferedInputStream;
-import java.io.BufferedWriter;
-import java.io.ByteArrayOutputStream;
+import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.lang.invoke.MethodHandle;
-import java.lang.invoke.MethodHandles;
-import java.lang.invoke.MethodType;
-import java.nio.charset.StandardCharsets;
+import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayDeque;
-import java.util.Deque;
-import java.util.Iterator;
-import java.util.Locale;
-import java.util.NoSuchElementException;
-import java.util.function.Consumer;
 
-public class TurtleChunker {
-
-	private int consecutiveBackslashes;
-	private boolean prefixOrBase;
-
-	private enum State {
-		DEFAULT, PERIOD_PENDING, IRI, LITERAL, MULTILINE_LITERAL, LANG_TAG_OR_DATATYPE, PREFIX_OR_BASE,
-		CONSUME_WHITESPACE
-	}
-
-	private State state = State.DEFAULT;
+public final class TurtleChunker {
 
 	private static final int BUFFER_SIZE = 1024 * 1024 * 4;
+	private static final int PREFIX_BUFFER_INITIAL_SIZE = 8 * 1024;
+	private static final int PARTIAL_BUFFER_INITIAL_SIZE = 64 * 1024;
 
-	private final InputStream in; // CHANGED (was Reader)
+	private static final byte DEFAULT = 0;
+	private static final byte PERIOD_PENDING = 1;
+	private static final byte IRI = 2;
+	private static final byte LITERAL = 3;
+	private static final byte MULTILINE_LITERAL = 4;
+	private static final byte LANG_TAG_OR_DATATYPE = 5;
+	private static final byte PREFIX_OR_BASE = 6;
+	private static final byte CONSUME_WHITESPACE = 7;
+	private static final byte COMMENT = 8;
+	private static final byte QUOTE_START = 9;
+	private static final byte QUOTE_START_SECOND = 10;
+
+	private final InputStream in;
 	private final byte[] chunkBuf = new byte[BUFFER_SIZE];
-	private int bufPos = 0, bufLen = 0;
+	private final ByteAccumulator partialBytes = new ByteAccumulator(PARTIAL_BUFFER_INITIAL_SIZE);
 
-	/**
-	 * Stores partial bytes if the block spans multiple reads. If we never
-	 * refill mid-block, we won't need this.
-	 */
-	private final ByteArrayOutputStream partialBytes = new ByteArrayOutputStream(); // CHANGED
+	private int bufPos;
+	private int bufLen;
+	private int chunkStart;
 
-	private final Deque<Character> nestingStack = new ArrayDeque<>();
+	private boolean multiReadBlock;
+	private boolean currentBlockIsPrefixOrBase;
+	private boolean seenNonIgnorableInBlock;
+
+	private byte state = DEFAULT;
 	private byte literalDelimiter;
+	private int consecutiveBackslashes;
 
-	private final MethodHandle[] defaultActions = new MethodHandle[256];
-	private String finishedOneBlock = null;
+	private byte[] nestingStack = new byte[32];
+	private int nestingDepth;
 
-	/**
-	 * Indicates whether the current block has already crossed multiple reads
-	 * (thus is partially in `partialBytes`).
-	 */
-	private boolean multiReadBlock = false; // CHANGED
-	/**
-	 * Marks where the current block started in `chunkBuf` if not in multi-read
-	 * mode.
-	 */
-	private int chunkStart = 0; // CHANGED
+	private byte[] pendingBytes;
+	private int pendingOffset;
+	private int pendingLength;
+	private boolean pendingPrefixOrBase;
 
-	public TurtleChunker(InputStream in) { // CHANGED
+	public TurtleChunker(InputStream in) {
+		if (in == null) {
+			throw new NullPointerException();
+		}
 		this.in = in;
-		buildDefaultActions();
 	}
 
-	private void buildDefaultActions() {
-		try {
-			MethodHandles.Lookup lookup = MethodHandles.lookup();
-			MethodType rawMt = MethodType.methodType(void.class, byte.class);
+	@FunctionalInterface
+	public interface BlockConsumer {
+		/**
+		 * The bytes are valid only during this call. Do not retain the array
+		 * unless you copy it.
+		 */
+		void accept(byte[] bytes, int offset, int length, boolean prefixOrBase) throws IOException;
+	}
 
-			MethodHandle rawLt = lookup.findVirtual(TurtleChunker.class, "handleLtInDefault", rawMt);
-			MethodHandle rawHash = lookup.findVirtual(TurtleChunker.class, "handleHashInDefault", rawMt);
-			MethodHandle rawLParen = lookup.findVirtual(TurtleChunker.class, "handleLParenInDefault", rawMt);
-			MethodHandle rawRParen = lookup.findVirtual(TurtleChunker.class, "handleRParenInDefault", rawMt);
-			MethodHandle rawLBrack = lookup.findVirtual(TurtleChunker.class, "handleLBrackInDefault", rawMt);
-			MethodHandle rawRBrack = lookup.findVirtual(TurtleChunker.class, "handleRBrackInDefault", rawMt);
-			MethodHandle rawQ1 = lookup.findVirtual(TurtleChunker.class, "handleQuote1InDefault", rawMt);
-			MethodHandle rawQ2 = lookup.findVirtual(TurtleChunker.class, "handleQuote2InDefault", rawMt);
-			MethodHandle rawDot = lookup.findVirtual(TurtleChunker.class, "handleDotInDefault", rawMt);
-			MethodHandle rawBackslash = lookup.findVirtual(TurtleChunker.class, "handleBackslashInDefault", rawMt);
-			MethodHandle rawAt = lookup.findVirtual(TurtleChunker.class, "handleAtInDefault", rawMt);
-
-			MethodHandle boundLt = rawLt.bindTo(this);
-			MethodHandle boundHash = rawHash.bindTo(this);
-			MethodHandle boundLParen = rawLParen.bindTo(this);
-			MethodHandle boundRParen = rawRParen.bindTo(this);
-			MethodHandle boundLBrack = rawLBrack.bindTo(this);
-			MethodHandle boundRBrack = rawRBrack.bindTo(this);
-			MethodHandle boundQ1 = rawQ1.bindTo(this);
-			MethodHandle boundQ2 = rawQ2.bindTo(this);
-			MethodHandle boundDot = rawDot.bindTo(this);
-			MethodHandle boundBackslash = rawBackslash.bindTo(this);
-			MethodHandle boundAt = rawAt.bindTo(this);
-
-			defaultActions['<'] = boundLt;
-			defaultActions['#'] = boundHash;
-			defaultActions['('] = boundLParen;
-			defaultActions[')'] = boundRParen;
-			defaultActions['['] = boundLBrack;
-			defaultActions[']'] = boundRBrack;
-			defaultActions['\''] = boundQ1;
-			defaultActions['"'] = boundQ2;
-			defaultActions['.'] = boundDot;
-			defaultActions['\\'] = boundBackslash;
-			defaultActions['@'] = boundAt;
-
-		} catch (NoSuchMethodException | IllegalAccessException e) {
-			throw new RuntimeException("Failed to build defaultActions", e);
+	public void forEachBlock(BlockConsumer consumer) throws IOException {
+		while (nextBlock(consumer)) {
+			// Intentionally empty.
 		}
 	}
 
-	/*
-	 * ---------------------------------------------------------------- The main
-	 * loop that reads & parses blocks.
-	 * ----------------------------------------------------------------
-	 */
-	private String parseNextBlock() throws IOException {
+	public boolean nextBlock(BlockConsumer consumer) throws IOException {
+		if (consumer == null) {
+			throw new NullPointerException();
+		}
+
 		while (true) {
 			if (bufPos >= bufLen) {
 				readMoreData();
 			}
+
 			if (bufLen == 0) {
-				// no more data => produce leftover partial if any
-				if (partialBytes.size() > 0) { // CHANGED
-					String leftoverStr = partialBytes.toString(StandardCharsets.UTF_8);
-					partialBytes.reset(); // CHANGED
-					leftoverStr = leftoverStr.trim();
-					return leftoverStr.isEmpty() ? null : leftoverStr;
-				}
-				return null; // truly no more
+				return emitLeftoverAtEof(consumer);
 			}
+
 			switch (state) {
 				case DEFAULT -> parseDefaultOneStep();
 				case PERIOD_PENDING -> parsePeriodOneStep();
@@ -138,77 +94,99 @@ public class TurtleChunker {
 				case MULTILINE_LITERAL -> parseMultilineLiteralOneStep();
 				case LANG_TAG_OR_DATATYPE -> parseLangTagOrDatatypeOneStep();
 				case PREFIX_OR_BASE -> parsePrefixOrBaseOneStep();
-				case CONSUME_WHITESPACE -> {
-					// This state is not used in the current implementation.
-					// It can be used to handle whitespace between tokens.
-					// For now, we just skip it.
-					if (Character.isWhitespace(chunkBuf[bufPos])) {
-						chunkStart++;
-						bufPos++;
-					} else {
-						// If we encounter a non-whitespace character, we need to
-						// handle it.
-						// We can either transition to the DEFAULT state or handle
-						// it as a special case.
-						state = State.DEFAULT;
-					}
-				}
+				case CONSUME_WHITESPACE -> parseConsumeWhitespaceOneStep();
+				case COMMENT -> parseCommentOneStep();
+				case QUOTE_START -> parseQuoteStartOneStep();
+				case QUOTE_START_SECOND -> parseQuoteStartSecondOneStep();
+				default -> throw new TurtleSyntaxException();
 			}
-			if (finishedOneBlock != null) {
-				String block = finishedOneBlock;
-				finishedOneBlock = null;
-				state = State.CONSUME_WHITESPACE;
-				return block;
+
+			if (pendingBytes != null && emitPending(consumer)) {
+				return true;
 			}
 		}
 	}
-
-	private void parsePrefixOrBaseOneStep() {
-		byte b = nextByte();
-		if (b != 'p' && b != 'b') {
-			throw new RuntimeException("Expected 'p' or 'b' after '@', but got: " + (char) b);
-		}
-		this.prefixOrBase = true;
-		this.state = State.DEFAULT;
-	}
-
-	/*
-	 * ----------------------------------------------------------------
-	 * parseXxxOneStep methods: We do not append to partialBytes here unless we
-	 * are finalizing the block. We parse in-place from chunkBuf for ASCII
-	 * triggers, etc.
-	 * ----------------------------------------------------------------
-	 */
 
 	private void parseDefaultOneStep() throws IOException {
 		byte b = nextByte();
-		MethodHandle mh = defaultActions[b & 0xFF];
-		if (mh != null) {
-			try {
-				mh.invokeExact(b); // (byte)->void
-			} catch (Throwable t) {
-				if (t instanceof IOException ioException) {
-					throw ioException;
-				} else if (t instanceof Error error) {
-					throw error;
-				} else if (t instanceof RuntimeException runtimeException) {
-					throw runtimeException;
-				} else if (t instanceof InterruptedException) {
-					Thread.currentThread().interrupt();
-					throw new RuntimeException(t);
+
+		switch (b) {
+			case '<' -> {
+				seenNonIgnorableInBlock = true;
+				state = IRI;
+			}
+			case '#' -> state = COMMENT;
+			case '(' -> {
+				seenNonIgnorableInBlock = true;
+				pushNesting((byte) '(');
+			}
+			case ')' -> {
+				seenNonIgnorableInBlock = true;
+				popNesting();
+			}
+			case '[' -> {
+				seenNonIgnorableInBlock = true;
+				pushNesting((byte) '[');
+			}
+			case ']' -> {
+				seenNonIgnorableInBlock = true;
+				popNesting();
+			}
+			case '\'', '"' -> {
+				seenNonIgnorableInBlock = true;
+				literalDelimiter = b;
+				state = QUOTE_START;
+			}
+			case '.' -> {
+				seenNonIgnorableInBlock = true;
+				if (nestingDepth == 0) {
+					state = PERIOD_PENDING;
 				}
-				throw new RuntimeException(t);
+			}
+			case '\\' -> {
+				seenNonIgnorableInBlock = true;
+				skipEscapedByteInDefault();
+			}
+			case '@' -> {
+				if (seenNonIgnorableInBlock) {
+					throw new TurtleSyntaxException();
+				}
+				seenNonIgnorableInBlock = true;
+				currentBlockIsPrefixOrBase = true;
+				state = PREFIX_OR_BASE;
+			}
+			default -> {
+				if (!isTurtleWhitespace(b)) {
+					seenNonIgnorableInBlock = true;
+				}
 			}
 		}
 	}
 
 	private void parseIriOneStep() {
 		while (bufPos < bufLen) {
-			byte b = nextByte();
-			if (b == '>') {
-				state = State.DEFAULT;
+			if (nextByte() == '>') {
+				state = DEFAULT;
 				return;
 			}
+		}
+	}
+
+	private void parseQuoteStartOneStep() {
+		if (chunkBuf[bufPos] == literalDelimiter) {
+			bufPos++;
+			state = QUOTE_START_SECOND;
+		} else {
+			state = LITERAL;
+		}
+	}
+
+	private void parseQuoteStartSecondOneStep() {
+		if (chunkBuf[bufPos] == literalDelimiter) {
+			bufPos++;
+			state = MULTILINE_LITERAL;
+		} else {
+			state = LANG_TAG_OR_DATATYPE;
 		}
 	}
 
@@ -219,361 +197,406 @@ public class TurtleChunker {
 				consecutiveBackslashes++;
 				continue;
 			}
-			boolean escaped = (consecutiveBackslashes % 2 == 1);
-			consecutiveBackslashes = 0; // reset whenever we see a non-backslash
+
+			boolean escaped = (consecutiveBackslashes & 1) != 0;
+			consecutiveBackslashes = 0;
 
 			if (b == literalDelimiter && !escaped) {
-				state = State.LANG_TAG_OR_DATATYPE;
+				state = LANG_TAG_OR_DATATYPE;
 				return;
 			}
 		}
 	}
 
 	private void parseMultilineLiteralOneStep() throws IOException {
-
 		while (bufPos < bufLen) {
 			byte b = nextByte();
-
 			if (b == '\\') {
 				consecutiveBackslashes++;
 				continue;
 			}
 
-			boolean escaped = (consecutiveBackslashes % 2 == 1);
-			consecutiveBackslashes = 0; // reset whenever we see a non-backslash
+			boolean escaped = (consecutiveBackslashes & 1) != 0;
+			consecutiveBackslashes = 0;
 
-			if (b == literalDelimiter && !escaped) {
-				if (checkForTripleQuote(literalDelimiter)) {
-					state = State.LANG_TAG_OR_DATATYPE;
-					return;
-				}
+			if (b == literalDelimiter && !escaped && checkForTripleQuote(literalDelimiter)) {
+				state = LANG_TAG_OR_DATATYPE;
+				return;
 			}
 		}
 	}
 
-	private void parseLangTagOrDatatypeOneStep() throws IOException {
+	private void parseLangTagOrDatatypeOneStep() {
 		byte b = chunkBuf[bufPos];
-		// We do NOT consume it yet in case we want to pass it to default action
 
 		if (b == '@') {
-			// We detected a language tag start. For now, you said we don't
-			// parse it fully,
-			// so you might just consume the '@'
-
-			bufPos++; // consume '@'
-
-			state = State.DEFAULT;
+			bufPos++;
+			state = DEFAULT;
 		} else if (b == '^') {
-			// Could be start of ^^<datatype>
-			bufPos++; // consume '^'
-			state = State.DEFAULT;
+			bufPos++;
+			state = DEFAULT;
 		} else {
-			// Not '@' or '^', so let's pass it through to the defaultAction
-			// logic.
-			state = State.DEFAULT;
+			state = DEFAULT;
 		}
 	}
 
-	/*
-	 * ---------------------------------------------------------------- Special
-	 * char handlers in DEFAULT state
-	 * ----------------------------------------------------------------
-	 */
-
-	private void handleLtInDefault(byte b) {
-		state = State.IRI;
-	}
-
-	private void handleHashInDefault(byte b) {
-		skipComment();
-	}
-
-	private void handleLParenInDefault(byte b) {
-		nestingStack.push('(');
-	}
-
-	private void handleRParenInDefault(byte b) {
-		if (!nestingStack.isEmpty()) {
-			nestingStack.pop();
+	private void parsePrefixOrBaseOneStep() {
+		byte b = nextByte();
+		if (b != 'p' && b != 'P' && b != 'b' && b != 'B') {
+			throw new TurtleSyntaxException();
 		}
+		state = DEFAULT;
 	}
 
-	private void handleLBrackInDefault(byte b) {
-		nestingStack.push('[');
-	}
-
-	private void handleRBrackInDefault(byte b) {
-		if (!nestingStack.isEmpty()) {
-			nestingStack.pop();
-		}
-	}
-
-	private void handleQuote1InDefault(byte b) throws IOException {
-		if (checkForTripleQuote(b)) {
-			state = State.MULTILINE_LITERAL;
-			literalDelimiter = b;
+	private void parseConsumeWhitespaceOneStep() {
+		if (isTurtleWhitespace(chunkBuf[bufPos])) {
+			bufPos++;
+			chunkStart++;
 		} else {
-			state = State.LITERAL;
-			literalDelimiter = b;
+			state = DEFAULT;
 		}
 	}
 
-	private void handleQuote2InDefault(byte b) throws IOException {
-		if (checkForTripleQuote(b)) {
-			state = State.MULTILINE_LITERAL;
-			literalDelimiter = b;
-		} else {
-			state = State.LITERAL;
-			literalDelimiter = b;
+	private void parseCommentOneStep() {
+		while (bufPos < bufLen) {
+			byte b = nextByte();
+			if (b == '\n' || b == '\r') {
+				state = DEFAULT;
+				return;
+			}
 		}
 	}
 
-	// Modified: Instead of finalizing directly, we transition to
-	// PERIOD_PENDING.
-	private void handleDotInDefault(byte b) {
-		if (nestingStack.isEmpty()) {
-			state = State.PERIOD_PENDING;
+	private void parsePeriodOneStep() {
+		byte next = chunkBuf[bufPos];
+		state = DEFAULT;
+
+		if (isTurtleWhitespace(next)) {
+			finalizeBlock();
 		}
 	}
 
-	private void handleBackslashInDefault(byte b) throws IOException {
-		// b is the backslash we've just encountered.
-		// Let's skip to the next byte if we're not at the end of the buffer.
-		// The next byte is escaped, so we don't need to check it.
+	private void skipEscapedByteInDefault() throws IOException {
 		if (bufPos >= bufLen) {
 			readMoreData();
 		}
 		if (bufPos < bufLen) {
-			nextByte(); // consume and discard the next byte
+			bufPos++;
 		}
-	}
-
-	private void handleAtInDefault(byte b) throws IOException {
-		if (!hasOnlyWhitespaceOrComments(chunkStart, bufPos - 1)) {
-			throw new RuntimeException("Unexpected @ in block: "
-					+ new String(chunkBuf, chunkStart, bufPos - chunkStart, StandardCharsets.UTF_8));
-		}
-		state = State.PREFIX_OR_BASE;
-	}
-
-	private boolean hasOnlyWhitespaceOrComments(int start, int endExclusive) {
-		int i = start;
-		while (i < endExclusive) {
-			byte current = chunkBuf[i];
-			if (current == '#') {
-				i++;
-				while (i < endExclusive) {
-					byte commentByte = chunkBuf[i];
-					if (commentByte == '\n' || commentByte == '\r') {
-						break;
-					}
-					i++;
-				}
-				continue;
-			}
-			if (current == ' ' || current == '\t' || current == '\n' || current == '\r') {
-				i++;
-				continue;
-			}
-			return false;
-		}
-		return true;
-	}
-
-	private void parsePeriodOneStep() {
-		// We assume bufPos < bufLen due to the check in parseNextBlock().
-		byte next = chunkBuf[bufPos];
-		if (next == ' ' || next == '\t' || next == '\n' || next == '\r') {
-			state = State.DEFAULT;
-			finalizeBlock();
-		} else {
-			state = State.DEFAULT;
-		}
-	}
-
-	/*
-	 * ----------------------------------------------------------------
-	 * finalizeBlock: build the final statement string
-	 * ----------------------------------------------------------------
-	 */
-	private void finalizeBlock() {
-		if (!multiReadBlock) {
-			// The entire block is in chunkBuf from chunkStart..bufPos
-			int length = bufPos - chunkStart;
-			if (length <= 0) {
-				return; // nothing
-			}
-			String block = new String(chunkBuf, chunkStart, length, StandardCharsets.UTF_8);
-
-			chunkStart = bufPos; // next block starts here
-			finishedOneBlock = block;
-		} else {
-			// partial data is in partialBytes + leftover in chunkBuf
-			if (bufPos > chunkStart) {
-				partialBytes.write(chunkBuf, chunkStart, (bufPos - chunkStart)); // CHANGED
-			}
-			String block = partialBytes.toString(StandardCharsets.UTF_8);
-
-			partialBytes.reset(); // CHANGED
-			finishedOneBlock = block;
-			multiReadBlock = false;
-			chunkStart = bufPos;
-		}
-	}
-
-	/*
-	 * ----------------------------------------------------------------
-	 * skipComment, tripleQuote, escaping checks We parse in place for
-	 * detection.
-	 * ----------------------------------------------------------------
-	 */
-
-	private void skipComment() {
-		while (true) {
-			if (bufPos >= bufLen) {
-				return;
-			}
-			byte b = nextByte();
-			// check if the byte represents an ASCII character, if not then it's
-			// not relevant to check
-			if ((b & 0x80) != 0) {
-				continue;
-			}
-
-			if (b == '\n') {
-				return;
-			}
-		}
-	}
-
-	private byte nextByte() {
-		return chunkBuf[bufPos++];
 	}
 
 	private boolean checkForTripleQuote(byte quoteChar) throws IOException {
 		if (bufPos >= bufLen) {
 			readMoreData();
 		}
+		if (bufPos >= bufLen || chunkBuf[bufPos] != quoteChar) {
+			return false;
+		}
+
+		bufPos++;
 
 		if (bufPos >= bufLen) {
+			readMoreData();
+		}
+		if (bufPos >= bufLen || chunkBuf[bufPos] != quoteChar) {
 			return false;
 		}
 
-		if (chunkBuf[bufPos] == quoteChar) {
-			bufPos++;
-			if (bufPos >= bufLen) {
-				readMoreData();
-			}
-			if (bufPos < bufLen) {
-				if (chunkBuf[bufPos] == quoteChar) {
-					bufPos++;
-					return true;
-				}
-				return false;
-			} else {
-				return false;
-			}
-		} else {
-			return false;
-		}
+		bufPos++;
+		return true;
 	}
 
-	/*
-	 * ----------------------------------------------------------------
-	 * readMoreData: if we run out of data & haven't ended the block, copy
-	 * leftover from chunkBuf to partialBytes to avoid overwriting it.
-	 * ----------------------------------------------------------------
-	 */
+	private void finalizeBlock() {
+		if (!multiReadBlock) {
+			int length = bufPos - chunkStart;
+			if (length <= 0) {
+				return;
+			}
+			pendingBytes = chunkBuf;
+			pendingOffset = chunkStart;
+			pendingLength = length;
+		} else {
+			if (bufPos > chunkStart) {
+				partialBytes.write(chunkBuf, chunkStart, bufPos - chunkStart);
+			}
+			pendingLength = partialBytes.size();
+			pendingBytes = partialBytes.detachBytes();
+			pendingOffset = 0;
+			multiReadBlock = false;
+		}
+
+		pendingPrefixOrBase = currentBlockIsPrefixOrBase;
+		chunkStart = bufPos;
+	}
+
+	private boolean emitPending(BlockConsumer consumer) throws IOException {
+		byte[] bytes = pendingBytes;
+		int offset = pendingOffset;
+		int end = offset + pendingLength;
+		boolean prefixOrBase = pendingPrefixOrBase;
+
+		pendingBytes = null;
+		pendingOffset = 0;
+		pendingLength = 0;
+		pendingPrefixOrBase = false;
+
+		while (offset < end && isTurtleWhitespace(bytes[offset])) {
+			offset++;
+		}
+		while (end > offset && isTurtleWhitespace(bytes[end - 1])) {
+			end--;
+		}
+
+		state = CONSUME_WHITESPACE;
+		resetBlockFlags();
+
+		int length = end - offset;
+		if (length <= 0) {
+			return false;
+		}
+
+		consumer.accept(bytes, offset, length, prefixOrBase);
+		return true;
+	}
+
+	private boolean emitLeftoverAtEof(BlockConsumer consumer) throws IOException {
+		if (!multiReadBlock && partialBytes.size() == 0) {
+			return false;
+		}
+
+		pendingLength = partialBytes.size();
+		pendingBytes = partialBytes.detachBytes();
+		pendingOffset = 0;
+		pendingPrefixOrBase = currentBlockIsPrefixOrBase;
+		multiReadBlock = false;
+		chunkStart = 0;
+
+		return emitPending(consumer);
+	}
+
+	private void resetBlockFlags() {
+		currentBlockIsPrefixOrBase = false;
+		seenNonIgnorableInBlock = false;
+		consecutiveBackslashes = 0;
+		literalDelimiter = 0;
+		nestingDepth = 0;
+	}
+
 	private void readMoreData() throws IOException {
-		// If we haven't finished the current block
 		if (chunkStart < bufLen) {
-			partialBytes.write(chunkBuf, chunkStart, bufLen - chunkStart); // CHANGED
+			partialBytes.write(chunkBuf, chunkStart, bufLen - chunkStart);
 			multiReadBlock = true;
 		}
+
 		chunkStart = 0;
-		bufLen = in.read(chunkBuf);
 		bufPos = 0;
-		if (bufLen == -1) {
-			bufLen = 0; // EOF
+
+		int read;
+		do {
+			read = in.read(chunkBuf);
+		} while (read == 0);
+
+		bufLen = read < 0 ? 0 : read;
+	}
+
+	private byte nextByte() {
+		return chunkBuf[bufPos++];
+	}
+
+	private void pushNesting(byte b) {
+		if (nestingDepth == nestingStack.length) {
+			byte[] larger = new byte[nestingStack.length << 1];
+			System.arraycopy(nestingStack, 0, larger, 0, nestingStack.length);
+			nestingStack = larger;
+		}
+		nestingStack[nestingDepth++] = b;
+	}
+
+	private void popNesting() {
+		if (nestingDepth != 0) {
+			nestingDepth--;
 		}
 	}
 
-	/*
-	 * ----------------------------------------------------------------
-	 * BlockIterator
-	 * ----------------------------------------------------------------
-	 */
-
-	public BlockIterator blockIterator() {
-		return new BlockIterator();
+	private static boolean isTurtleWhitespace(byte b) {
+		return b == ' ' || b == '\t' || b == '\n' || b == '\r';
 	}
 
-	public class BlockIterator implements Iterator<String> {
-		private String nextBlock;
-		private boolean done;
-		Consumer<String> prefixConsumer = null;
+	private static int trimTrailingTurtleWhitespace(byte[] bytes, int length) {
+		while (length > 0 && isTurtleWhitespace(bytes[length - 1])) {
+			length--;
+		}
+		return length;
+	}
 
-		public void setPrefixConsumer(Consumer<String> prefixConsumer) {
-			this.prefixConsumer = prefixConsumer;
+	public static int writeChunks(Path inputFile, long approximateChunkSizeBytes, Path outputDir) throws IOException {
+		if (approximateChunkSizeBytes <= 0) {
+			throw new IllegalArgumentException("Chunk size must be greater than zero");
+		}
+		if (!Files.isRegularFile(inputFile)) {
+			throw new IOException("Input file not found: " + inputFile);
 		}
 
-		String getPrefixes() {
-			StringBuilder sb = new StringBuilder();
-//			while (hasNext()) {
-//				String lowerCase = nextBlock.trim().toLowerCase();
-//				if (lowerCase.isEmpty() || lowerCase.startsWith("#")) {
-//					nextBlock = null;
-//				} else if (lowerCase.startsWith("@prefix") || lowerCase.startsWith("@base")) {
-//					sb.append(nextBlock.trim()).append("\n");
-//					nextBlock = null;
-//				} else {
-//					break;
-//				}
-//			}
-			return sb.toString();
+		Files.createDirectories(outputDir);
+
+		ChunkSink sink = new ChunkSink(outputDir, approximateChunkSizeBytes);
+		try (InputStream inputStream = new BufferedInputStream(Files.newInputStream(inputFile), BUFFER_SIZE); sink) {
+			new TurtleChunker(inputStream).forEachBlock(sink);
+		}
+
+		System.out.print("Wrote ");
+		System.out.print(sink.statements());
+		System.out.print(" statements into ");
+		System.out.print(sink.chunkCount());
+		System.out.print(" chunk file(s): ");
+		System.out.println(outputDir.toAbsolutePath());
+
+		return sink.chunkCount();
+	}
+
+	private static final class ChunkSink implements BlockConsumer, AutoCloseable {
+		private final Path outputDir;
+		private final long approximateChunkSizeBytes;
+		private final ByteAccumulator prefixes = new ByteAccumulator(PREFIX_BUFFER_INITIAL_SIZE);
+
+		private OutputStream currentOutput;
+		private long currentChunkBytes;
+		private long statements;
+		private int chunkIndex;
+
+		private ChunkSink(Path outputDir, long approximateChunkSizeBytes) {
+			this.outputDir = outputDir;
+			this.approximateChunkSizeBytes = approximateChunkSizeBytes;
 		}
 
 		@Override
-		public boolean hasNext() {
-			if (done) {
-				return false;
+		public void accept(byte[] bytes, int offset, int length, boolean prefixOrBase) throws IOException {
+			if (prefixOrBase) {
+				prefixes.write(bytes, offset, length);
+				prefixes.write('\n');
+				return;
 			}
-			if (nextBlock != null) {
-				return true;
-			}
-			while (true) {
-				try {
-					nextBlock = parseNextBlock();
-					if (prefixOrBase) {
-						if (this.prefixConsumer != null) {
-							this.prefixConsumer.accept(nextBlock);
-						}
-						prefixOrBase = false;
-						nextBlock = null;
-					} else {
-						if (nextBlock == null) {
-							done = true;
-							return false;
-						}
-						return true;
-					}
 
-				} catch (IOException e) {
-					done = true;
-					throw new RuntimeException("IO error during iteration", e);
+			if (length == 0) {
+				return;
+			}
+
+			if (currentOutput == null) {
+				openNextChunk();
+			}
+
+			currentOutput.write(bytes, offset, length);
+			currentOutput.write('\n');
+			currentChunkBytes += length + 1L;
+			statements++;
+
+			if (currentChunkBytes > approximateChunkSizeBytes) {
+				closeCurrentOutput();
+			}
+		}
+
+		private void openNextChunk() throws IOException {
+			chunkIndex++;
+			Path chunkPath = outputDir.resolve(formatChunkFileName(chunkIndex));
+			currentOutput = new BufferedOutputStream(Files.newOutputStream(chunkPath), BUFFER_SIZE);
+			currentChunkBytes = writeChunkHeader(currentOutput, prefixes);
+		}
+
+		private static long writeChunkHeader(OutputStream output, ByteAccumulator prefixes) throws IOException {
+			int length = trimTrailingTurtleWhitespace(prefixes.array(), prefixes.size());
+			if (length == 0) {
+				return 0;
+			}
+
+			output.write(prefixes.array(), 0, length);
+			output.write('\n');
+			output.write('\n');
+			return length + 2L;
+		}
+
+		private void closeCurrentOutput() throws IOException {
+			if (currentOutput != null) {
+				currentOutput.close();
+				currentOutput = null;
+				currentChunkBytes = 0;
+			}
+		}
+
+		@Override
+		public void close() throws IOException {
+			closeCurrentOutput();
+		}
+
+		private long statements() {
+			return statements;
+		}
+
+		private int chunkCount() {
+			return chunkIndex;
+		}
+	}
+
+	private static final class ByteAccumulator {
+		private byte[] bytes;
+		private int size;
+
+		private ByteAccumulator(int initialCapacity) {
+			bytes = new byte[Math.max(1, initialCapacity)];
+		}
+
+		private void write(int b) {
+			ensureCapacity(size + 1);
+			bytes[size++] = (byte) b;
+		}
+
+		private void write(byte[] source, int offset, int length) {
+			if (length <= 0) {
+				return;
+			}
+			ensureCapacity(size + length);
+			System.arraycopy(source, offset, bytes, size, length);
+			size += length;
+		}
+
+		private byte[] detachBytes() {
+			byte[] detached = bytes;
+			bytes = new byte[PARTIAL_BUFFER_INITIAL_SIZE];
+			size = 0;
+			return detached;
+		}
+
+		private byte[] array() {
+			return bytes;
+		}
+
+		private int size() {
+			return size;
+		}
+
+		private void ensureCapacity(int minimumCapacity) {
+			if (minimumCapacity <= bytes.length) {
+				return;
+			}
+
+			int newCapacity = bytes.length;
+			while (newCapacity < minimumCapacity) {
+				int doubled = newCapacity << 1;
+				if (doubled <= 0) {
+					newCapacity = minimumCapacity;
+					break;
 				}
+				newCapacity = doubled;
 			}
 
+			byte[] larger = new byte[newCapacity];
+			System.arraycopy(bytes, 0, larger, 0, size);
+			bytes = larger;
 		}
+	}
 
-		@Override
-		public String next() {
-			if (!hasNext()) {
-				throw new NoSuchElementException("No more blocks");
-			}
-			String result = nextBlock;
-			nextBlock = null;
-			return result;
+	public static final class TurtleSyntaxException extends RuntimeException {
+		public TurtleSyntaxException() {
+			super();
 		}
 	}
 
@@ -589,7 +612,8 @@ public class TurtleChunker {
 		try {
 			chunkSizeBytes = parseChunkSize(args[1]);
 		} catch (IllegalArgumentException e) {
-			System.err.println("Invalid chunk size: " + e.getMessage());
+			System.err.print("Invalid chunk size: ");
+			System.err.println(e.getMessage());
 			printUsage();
 			System.exit(1);
 			return;
@@ -603,113 +627,97 @@ public class TurtleChunker {
 				System.out.println("No Turtle statements found; no chunk files written.");
 			}
 		} catch (IOException e) {
-			System.err.println("Chunking failed: " + e.getMessage());
+			System.err.print("Chunking failed: ");
+			System.err.println(e.getMessage());
 			System.exit(1);
 		}
 	}
 
-	static int writeChunks(Path inputFile, long approximateChunkSizeBytes, Path outputDir) throws IOException {
-		if (approximateChunkSizeBytes <= 0) {
-			throw new IllegalArgumentException("Chunk size must be greater than zero");
-		}
-		if (!Files.isRegularFile(inputFile)) {
-			throw new IOException("Input file not found: " + inputFile);
-		}
-
-		Files.createDirectories(outputDir);
-
-		StringBuilder prefixes = new StringBuilder();
-		int chunkIndex = 0;
-		long statements = 0;
-		BufferedWriter currentWriter = null;
-		long currentChunkBytes = 0;
-
-		try (InputStream inputStream = new BufferedInputStream(Files.newInputStream(inputFile))) {
-			TurtleChunker chunker = new TurtleChunker(inputStream);
-			BlockIterator iterator = chunker.blockIterator();
-			iterator.setPrefixConsumer(prefix -> {
-				String normalizedPrefix = prefix.strip();
-				if (!normalizedPrefix.isEmpty()) {
-					prefixes.append(normalizedPrefix).append('\n');
-				}
-			});
-
-			while (iterator.hasNext()) {
-				String block = iterator.next().strip();
-				if (block.isEmpty()) {
-					continue;
-				}
-
-				if (currentWriter == null) {
-					chunkIndex++;
-					Path chunkPath = outputDir.resolve(formatChunkFileName(chunkIndex));
-					currentWriter = Files.newBufferedWriter(chunkPath, StandardCharsets.UTF_8);
-					currentChunkBytes = writeChunkHeader(currentWriter, prefixes.toString());
-				}
-
-				String blockWithNewline = block + '\n';
-				currentWriter.write(blockWithNewline);
-				currentChunkBytes += utf8Size(blockWithNewline);
-				statements++;
-
-				if (currentChunkBytes > approximateChunkSizeBytes) {
-					currentWriter.close();
-					currentWriter = null;
-					currentChunkBytes = 0;
-				}
-			}
-		} finally {
-			if (currentWriter != null) {
-				currentWriter.close();
-			}
-		}
-
-		System.out.printf("Wrote %,d statements into %d chunk file(s): %s%n", statements, chunkIndex,
-				outputDir.toAbsolutePath());
-		return chunkIndex;
-	}
-
 	static long parseChunkSize(String rawValue) {
-		if (rawValue == null || rawValue.isBlank()) {
+		if (rawValue == null) {
 			throw new IllegalArgumentException("Size is empty");
 		}
 
-		String value = rawValue.trim();
-		int suffixStart = 0;
-		while (suffixStart < value.length() && Character.isDigit(value.charAt(suffixStart))) {
-			suffixStart++;
+		int start = 0;
+		int end = rawValue.length();
+		while (start < end && isAsciiBlank(rawValue.charAt(start))) {
+			start++;
+		}
+		while (end > start && isAsciiBlank(rawValue.charAt(end - 1))) {
+			end--;
+		}
+		if (start == end) {
+			throw new IllegalArgumentException("Size is empty");
 		}
 
-		if (suffixStart == 0) {
+		int i = start;
+		long numeric = 0;
+		while (i < end) {
+			char c = rawValue.charAt(i);
+			if (c < '0' || c > '9') {
+				break;
+			}
+			int digit = c - '0';
+			try {
+				numeric = Math.addExact(Math.multiplyExact(numeric, 10L), digit);
+			} catch (ArithmeticException e) {
+				throw new IllegalArgumentException("Chunk size is too large", e);
+			}
+			i++;
+		}
+
+		if (i == start) {
 			throw new IllegalArgumentException("Missing numeric size");
 		}
-
-		String numberPart = value.substring(0, suffixStart);
-		String suffix = value.substring(suffixStart).trim().toUpperCase(Locale.ROOT);
-		long numeric;
-		try {
-			numeric = Long.parseLong(numberPart);
-		} catch (NumberFormatException e) {
-			throw new IllegalArgumentException("Invalid numeric size: " + numberPart, e);
-		}
-
 		if (numeric <= 0) {
 			throw new IllegalArgumentException("Chunk size must be greater than zero");
 		}
 
-		long multiplier = switch (suffix) {
-			case "", "B" -> 1L;
-			case "K", "KB" -> 1024L;
-			case "M", "MB" -> 1024L * 1024L;
-			case "G", "GB" -> 1024L * 1024L * 1024L;
-			default -> throw new IllegalArgumentException("Unsupported size suffix: " + suffix);
-		};
+		while (i < end && isAsciiBlank(rawValue.charAt(i))) {
+			i++;
+		}
 
+		long multiplier = suffixMultiplier(rawValue, i, end);
 		try {
 			return Math.multiplyExact(numeric, multiplier);
 		} catch (ArithmeticException e) {
-			throw new IllegalArgumentException("Chunk size is too large: " + rawValue, e);
+			throw new IllegalArgumentException("Chunk size is too large", e);
 		}
+	}
+
+	private static long suffixMultiplier(String value, int start, int end) {
+		int length = end - start;
+		if (length == 0 || suffixEquals(value, start, end, 'B')) {
+			return 1L;
+		}
+		if (suffixEquals(value, start, end, 'K') || suffixEquals(value, start, end, 'K', 'B')) {
+			return 1024L;
+		}
+		if (suffixEquals(value, start, end, 'M') || suffixEquals(value, start, end, 'M', 'B')) {
+			return 1024L * 1024L;
+		}
+		if (suffixEquals(value, start, end, 'G') || suffixEquals(value, start, end, 'G', 'B')) {
+			return 1024L * 1024L * 1024L;
+		}
+		throw new IllegalArgumentException("Unsupported size suffix");
+	}
+
+	private static boolean suffixEquals(String value, int start, int end, char first) {
+		return end - start == 1 && asciiUpper(value.charAt(start)) == first;
+	}
+
+	private static boolean suffixEquals(String value, int start, int end, char first, char second) {
+		return end - start == 2
+				&& asciiUpper(value.charAt(start)) == first
+				&& asciiUpper(value.charAt(start + 1)) == second;
+	}
+
+	private static char asciiUpper(char c) {
+		return c >= 'a' && c <= 'z' ? (char) (c - ('a' - 'A')) : c;
+	}
+
+	private static boolean isAsciiBlank(char c) {
+		return c == ' ' || c == '\t' || c == '\n' || c == '\r';
 	}
 
 	private static Path defaultOutputDir(Path inputFile) {
@@ -717,27 +725,62 @@ public class TurtleChunker {
 		String fileName = fileNamePath == null ? inputFile.toString() : fileNamePath.toString();
 		int dotIndex = fileName.lastIndexOf('.');
 		String baseName = dotIndex > 0 ? fileName.substring(0, dotIndex) : fileName;
-		if (baseName.isBlank()) {
+		if (isBlank(baseName)) {
 			baseName = "ttl";
 		}
 		return Path.of(baseName + "-chunks");
 	}
 
-	private static String formatChunkFileName(int chunkIndex) {
-		return String.format("chunk-%05d.ttl", chunkIndex);
-	}
-
-	private static long writeChunkHeader(BufferedWriter writer, String prefixes) throws IOException {
-		if (prefixes.isBlank()) {
-			return 0;
+	private static boolean isBlank(String value) {
+		for (int i = 0, length = value.length(); i < length; i++) {
+			if (!isAsciiBlank(value.charAt(i))) {
+				return false;
+			}
 		}
-		String header = prefixes.stripTrailing() + "\n\n";
-		writer.write(header);
-		return utf8Size(header);
+		return true;
 	}
 
-	private static long utf8Size(String text) {
-		return text.getBytes(StandardCharsets.UTF_8).length;
+	private static String formatChunkFileName(int chunkIndex) {
+		int digits = decimalDigits(chunkIndex);
+		int zeroes = Math.max(0, 5 - digits);
+		char[] chars = new char[6 + zeroes + digits + 4];
+
+		int p = 0;
+		chars[p++] = 'c';
+		chars[p++] = 'h';
+		chars[p++] = 'u';
+		chars[p++] = 'n';
+		chars[p++] = 'k';
+		chars[p++] = '-';
+
+		for (int i = 0; i < zeroes; i++) {
+			chars[p++] = '0';
+		}
+
+		int digitStart = p;
+		int digitEnd = digitStart + digits;
+		int n = chunkIndex;
+		for (int i = digitEnd - 1; i >= digitStart; i--) {
+			chars[i] = (char) ('0' + (n % 10));
+			n /= 10;
+		}
+		p = digitEnd;
+
+		chars[p++] = '.';
+		chars[p++] = 't';
+		chars[p++] = 't';
+		chars[p] = 'l';
+
+		return new String(chars);
+	}
+
+	private static int decimalDigits(int value) {
+		int digits = 1;
+		while (value >= 10) {
+			value /= 10;
+			digits++;
+		}
+		return digits;
 	}
 
 	private static void printUsage() {

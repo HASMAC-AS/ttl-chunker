@@ -48,6 +48,29 @@ Behavior:
 - prepends every chunk with all `@prefix` / `@base` directives seen so far
 - default output dir: `<input-name>-chunks/`
 
+## Benchmarking
+
+Build the JMH benchmark jar:
+
+```bash
+mvn -Pbenchmark -DskipTests package
+```
+
+Run a quick local smoke benchmark:
+
+```bash
+java -jar target/benchmarks.jar TurtleChunkerBenchmark -wi 1 -i 3 -f 1
+```
+
+Useful parameters:
+
+```bash
+java -jar target/benchmarks.jar TurtleChunkerBenchmark \
+  -p blankNodeEvery=0,100,1 \
+  -p statements=20000 \
+  -p chunkSizeBytes=131072
+```
+
 ## Project Structure
 
 ```

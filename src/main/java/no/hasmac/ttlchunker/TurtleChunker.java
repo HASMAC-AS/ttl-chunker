@@ -5,8 +5,10 @@ import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.PrintStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.function.LongSupplier;
 
 public final class TurtleChunker {
 
@@ -25,6 +27,7 @@ public final class TurtleChunker {
 	private static final byte COMMENT = 8;
 	private static final byte QUOTE_START = 9;
 	private static final byte QUOTE_START_SECOND = 10;
+	private static final byte BLANK_NODE_LABEL = 11;
 
 	private final InputStream in;
 	private final byte[] chunkBuf = new byte[BUFFER_SIZE];
@@ -36,11 +39,14 @@ public final class TurtleChunker {
 
 	private boolean multiReadBlock;
 	private boolean currentBlockIsPrefixOrBase;
+	private boolean currentBlockHasBlankNodeLabel;
 	private boolean seenNonIgnorableInBlock;
+	private boolean nextDefaultByteAtTokenBoundary = true;
 
 	private byte state = DEFAULT;
 	private byte literalDelimiter;
 	private int consecutiveBackslashes;
+	private boolean blankNodeLabelColonSeen;
 
 	private byte[] nestingStack = new byte[32];
 	private int nestingDepth;
@@ -49,6 +55,7 @@ public final class TurtleChunker {
 	private int pendingOffset;
 	private int pendingLength;
 	private boolean pendingPrefixOrBase;
+	private boolean pendingBlankNodeLabel;
 
 	public TurtleChunker(InputStream in) {
 		if (in == null) {
@@ -64,6 +71,11 @@ public final class TurtleChunker {
 		 * unless you copy it.
 		 */
 		void accept(byte[] bytes, int offset, int length, boolean prefixOrBase) throws IOException;
+
+		default void accept(byte[] bytes, int offset, int length, boolean prefixOrBase, boolean blankNodeLabel)
+				throws IOException {
+			accept(bytes, offset, length, prefixOrBase);
+		}
 	}
 
 	public void forEachBlock(BlockConsumer consumer) throws IOException {
@@ -98,6 +110,7 @@ public final class TurtleChunker {
 				case COMMENT -> parseCommentOneStep();
 				case QUOTE_START -> parseQuoteStartOneStep();
 				case QUOTE_START_SECOND -> parseQuoteStartSecondOneStep();
+				case BLANK_NODE_LABEL -> parseBlankNodeLabelOneStep();
 				default -> throw new TurtleSyntaxException();
 			}
 
@@ -109,6 +122,7 @@ public final class TurtleChunker {
 
 	private void parseDefaultOneStep() throws IOException {
 		byte b = nextByte();
+		boolean tokenBoundaryBeforeByte = nextDefaultByteAtTokenBoundary;
 
 		switch (b) {
 			case '<' -> {
@@ -147,6 +161,13 @@ public final class TurtleChunker {
 				seenNonIgnorableInBlock = true;
 				skipEscapedByteInDefault();
 			}
+			case '_' -> {
+				seenNonIgnorableInBlock = true;
+				if (tokenBoundaryBeforeByte) {
+					blankNodeLabelColonSeen = false;
+					state = BLANK_NODE_LABEL;
+				}
+			}
 			case '@' -> {
 				if (seenNonIgnorableInBlock) {
 					throw new TurtleSyntaxException();
@@ -161,6 +182,8 @@ public final class TurtleChunker {
 				}
 			}
 		}
+
+		nextDefaultByteAtTokenBoundary = isTokenBoundaryAfter(b);
 	}
 
 	private void parseIriOneStep() {
@@ -252,6 +275,7 @@ public final class TurtleChunker {
 		if (isTurtleWhitespace(chunkBuf[bufPos])) {
 			bufPos++;
 			chunkStart++;
+			nextDefaultByteAtTokenBoundary = true;
 		} else {
 			state = DEFAULT;
 		}
@@ -261,10 +285,32 @@ public final class TurtleChunker {
 		while (bufPos < bufLen) {
 			byte b = nextByte();
 			if (b == '\n' || b == '\r') {
+				nextDefaultByteAtTokenBoundary = true;
 				state = DEFAULT;
 				return;
 			}
 		}
+	}
+
+	private void parseBlankNodeLabelOneStep() {
+		byte b = nextByte();
+		if (!blankNodeLabelColonSeen) {
+			if (b == ':') {
+				blankNodeLabelColonSeen = true;
+				nextDefaultByteAtTokenBoundary = false;
+			} else {
+				nextDefaultByteAtTokenBoundary = isTokenBoundaryAfter(b);
+				state = DEFAULT;
+			}
+			return;
+		}
+
+		if (isBlankNodeLabelFirstChar(b)) {
+			currentBlockHasBlankNodeLabel = true;
+		}
+		blankNodeLabelColonSeen = false;
+		nextDefaultByteAtTokenBoundary = isTokenBoundaryAfter(b);
+		state = DEFAULT;
 	}
 
 	private void parsePeriodOneStep() {
@@ -326,6 +372,7 @@ public final class TurtleChunker {
 		}
 
 		pendingPrefixOrBase = currentBlockIsPrefixOrBase;
+		pendingBlankNodeLabel = currentBlockHasBlankNodeLabel;
 		chunkStart = bufPos;
 	}
 
@@ -334,11 +381,13 @@ public final class TurtleChunker {
 		int offset = pendingOffset;
 		int end = offset + pendingLength;
 		boolean prefixOrBase = pendingPrefixOrBase;
+		boolean blankNodeLabel = pendingBlankNodeLabel;
 
 		pendingBytes = null;
 		pendingOffset = 0;
 		pendingLength = 0;
 		pendingPrefixOrBase = false;
+		pendingBlankNodeLabel = false;
 
 		while (offset < end && isTurtleWhitespace(bytes[offset])) {
 			offset++;
@@ -355,7 +404,7 @@ public final class TurtleChunker {
 			return false;
 		}
 
-		consumer.accept(bytes, offset, length, prefixOrBase);
+		consumer.accept(bytes, offset, length, prefixOrBase, blankNodeLabel);
 		return true;
 	}
 
@@ -368,6 +417,7 @@ public final class TurtleChunker {
 		pendingBytes = partialBytes.detachBytes();
 		pendingOffset = 0;
 		pendingPrefixOrBase = currentBlockIsPrefixOrBase;
+		pendingBlankNodeLabel = currentBlockHasBlankNodeLabel;
 		multiReadBlock = false;
 		chunkStart = 0;
 
@@ -376,7 +426,10 @@ public final class TurtleChunker {
 
 	private void resetBlockFlags() {
 		currentBlockIsPrefixOrBase = false;
+		currentBlockHasBlankNodeLabel = false;
 		seenNonIgnorableInBlock = false;
+		nextDefaultByteAtTokenBoundary = true;
+		blankNodeLabelColonSeen = false;
 		consecutiveBackslashes = 0;
 		literalDelimiter = 0;
 		nestingDepth = 0;
@@ -422,6 +475,22 @@ public final class TurtleChunker {
 		return b == ' ' || b == '\t' || b == '\n' || b == '\r';
 	}
 
+	private static boolean isTokenBoundaryAfter(byte b) {
+		return isTurtleWhitespace(b)
+				|| b == '('
+				|| b == '['
+				|| b == ','
+				|| b == ';';
+	}
+
+	private static boolean isBlankNodeLabelFirstChar(byte b) {
+		return (b >= 'A' && b <= 'Z')
+				|| (b >= 'a' && b <= 'z')
+				|| (b >= '0' && b <= '9')
+				|| b == '_'
+				|| (b & 0x80) != 0;
+	}
+
 	private static int trimTrailingTurtleWhitespace(byte[] bytes, int length) {
 		while (length > 0 && isTurtleWhitespace(bytes[length - 1])) {
 			length--;
@@ -429,7 +498,39 @@ public final class TurtleChunker {
 		return length;
 	}
 
+	private static void printSeconds(PrintStream output, long elapsedMillis) {
+		long seconds = elapsedMillis / 1000L;
+		long millis = elapsedMillis % 1000L;
+		output.print(seconds);
+		output.print('.');
+		if (millis < 100L) {
+			output.print('0');
+		}
+		if (millis < 10L) {
+			output.print('0');
+		}
+		output.print(millis);
+	}
+
 	public static int writeChunks(Path inputFile, long approximateChunkSizeBytes, Path outputDir) throws IOException {
+		return writeChunks(inputFile, approximateChunkSizeBytes, outputDir, true, System.out,
+				System::currentTimeMillis);
+	}
+
+	static int writeChunks(Path inputFile, long approximateChunkSizeBytes, Path outputDir, boolean printStatus)
+			throws IOException {
+		return writeChunks(inputFile, approximateChunkSizeBytes, outputDir, printStatus, System.out,
+				System::currentTimeMillis);
+	}
+
+	static int writeChunks(Path inputFile, long approximateChunkSizeBytes, Path outputDir, boolean printStatus,
+			PrintStream statusOutput, LongSupplier currentTimeMillis) throws IOException {
+		if (printStatus && statusOutput == null) {
+			throw new NullPointerException();
+		}
+		if (currentTimeMillis == null) {
+			throw new NullPointerException();
+		}
 		if (approximateChunkSizeBytes <= 0) {
 			throw new IllegalArgumentException("Chunk size must be greater than zero");
 		}
@@ -439,17 +540,20 @@ public final class TurtleChunker {
 
 		Files.createDirectories(outputDir);
 
-		ChunkSink sink = new ChunkSink(outputDir, approximateChunkSizeBytes);
+		ChunkSink sink = new ChunkSink(outputDir, approximateChunkSizeBytes, printStatus, statusOutput,
+				currentTimeMillis);
 		try (InputStream inputStream = new BufferedInputStream(Files.newInputStream(inputFile), BUFFER_SIZE); sink) {
 			new TurtleChunker(inputStream).forEachBlock(sink);
 		}
 
-		System.out.print("Wrote ");
-		System.out.print(sink.statements());
-		System.out.print(" statements into ");
-		System.out.print(sink.chunkCount());
-		System.out.print(" chunk file(s): ");
-		System.out.println(outputDir.toAbsolutePath());
+		if (printStatus) {
+			statusOutput.print("Wrote ");
+			statusOutput.print(sink.statements());
+			statusOutput.print(" statements into ");
+			statusOutput.print(sink.chunkCount());
+			statusOutput.print(" chunk file(s): ");
+			statusOutput.println(outputDir.toAbsolutePath());
+		}
 
 		return sink.chunkCount();
 	}
@@ -457,20 +561,38 @@ public final class TurtleChunker {
 	private static final class ChunkSink implements BlockConsumer, AutoCloseable {
 		private final Path outputDir;
 		private final long approximateChunkSizeBytes;
+		private final boolean printStatus;
+		private final PrintStream statusOutput;
+		private final LongSupplier currentTimeMillis;
 		private final ByteAccumulator prefixes = new ByteAccumulator(PREFIX_BUFFER_INITIAL_SIZE);
 
 		private OutputStream currentOutput;
+		private OutputStream blankNodeOutput;
+		private Path currentChunkPath;
+		private Path blankNodeChunkPath;
+		private long currentChunkStartedMillis;
+		private long blankNodeChunkStartedMillis;
 		private long currentChunkBytes;
 		private long statements;
 		private int chunkIndex;
 
-		private ChunkSink(Path outputDir, long approximateChunkSizeBytes) {
+		private ChunkSink(Path outputDir, long approximateChunkSizeBytes, boolean printStatus,
+				PrintStream statusOutput, LongSupplier currentTimeMillis) {
 			this.outputDir = outputDir;
 			this.approximateChunkSizeBytes = approximateChunkSizeBytes;
+			this.printStatus = printStatus;
+			this.statusOutput = statusOutput;
+			this.currentTimeMillis = currentTimeMillis;
 		}
 
 		@Override
 		public void accept(byte[] bytes, int offset, int length, boolean prefixOrBase) throws IOException {
+			accept(bytes, offset, length, prefixOrBase, false);
+		}
+
+		@Override
+		public void accept(byte[] bytes, int offset, int length, boolean prefixOrBase, boolean blankNodeLabel)
+				throws IOException {
 			if (prefixOrBase) {
 				prefixes.write(bytes, offset, length);
 				prefixes.write('\n');
@@ -478,6 +600,11 @@ public final class TurtleChunker {
 			}
 
 			if (length == 0) {
+				return;
+			}
+
+			if (blankNodeLabel) {
+				writeBlankNodeStatement(bytes, offset, length);
 				return;
 			}
 
@@ -495,11 +622,32 @@ public final class TurtleChunker {
 			}
 		}
 
+		private void writeBlankNodeStatement(byte[] bytes, int offset, int length) throws IOException {
+			if (blankNodeOutput == null) {
+				openBlankNodeChunk();
+			}
+
+			blankNodeOutput.write(bytes, offset, length);
+			blankNodeOutput.write('\n');
+			statements++;
+		}
+
 		private void openNextChunk() throws IOException {
 			chunkIndex++;
 			Path chunkPath = outputDir.resolve(formatChunkFileName(chunkIndex));
+			currentChunkPath = chunkPath;
+			currentChunkStartedMillis = currentTimeMillis.getAsLong();
 			currentOutput = new BufferedOutputStream(Files.newOutputStream(chunkPath), BUFFER_SIZE);
 			currentChunkBytes = writeChunkHeader(currentOutput, prefixes);
+		}
+
+		private void openBlankNodeChunk() throws IOException {
+			chunkIndex++;
+			Path chunkPath = outputDir.resolve(formatChunkFileName(chunkIndex));
+			blankNodeChunkPath = chunkPath;
+			blankNodeChunkStartedMillis = currentTimeMillis.getAsLong();
+			blankNodeOutput = new BufferedOutputStream(Files.newOutputStream(chunkPath), BUFFER_SIZE);
+			writeChunkHeader(blankNodeOutput, prefixes);
 		}
 
 		private static long writeChunkHeader(OutputStream output, ByteAccumulator prefixes) throws IOException {
@@ -517,14 +665,55 @@ public final class TurtleChunker {
 		private void closeCurrentOutput() throws IOException {
 			if (currentOutput != null) {
 				currentOutput.close();
+				logChunk(currentChunkPath, currentChunkStartedMillis);
 				currentOutput = null;
+				currentChunkPath = null;
 				currentChunkBytes = 0;
 			}
 		}
 
+		private void closeBlankNodeOutput() throws IOException {
+			if (blankNodeOutput != null) {
+				blankNodeOutput.close();
+				logChunk(blankNodeChunkPath, blankNodeChunkStartedMillis);
+				blankNodeOutput = null;
+				blankNodeChunkPath = null;
+			}
+		}
+
+		private void logChunk(Path chunkPath, long startedMillis) {
+			if (!printStatus) {
+				return;
+			}
+
+			long elapsedMillis = Math.max(0L, currentTimeMillis.getAsLong() - startedMillis);
+			statusOutput.print("Wrote chunk ");
+			statusOutput.print(chunkPath.getFileName());
+			statusOutput.print(" in ");
+			printSeconds(statusOutput, elapsedMillis);
+			statusOutput.println(" seconds");
+		}
+
 		@Override
 		public void close() throws IOException {
-			closeCurrentOutput();
+			IOException failure = null;
+			try {
+				closeCurrentOutput();
+			} catch (IOException e) {
+				failure = e;
+			}
+			try {
+				closeBlankNodeOutput();
+			} catch (IOException e) {
+				if (failure == null) {
+					failure = e;
+				} else {
+					failure.addSuppressed(e);
+				}
+			}
+			if (failure != null) {
+				throw failure;
+			}
 		}
 
 		private long statements() {

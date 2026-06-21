@@ -155,6 +155,140 @@ class TurtleChunkerTest {
 		assertTrue(output.contains("Wrote chunk chunk-00002.ttl in 0.750 seconds\n"));
 	}
 
+	@Test
+	void writeChunksSplitsTrigGraphByStatementsAndRewrapsEachChunk(@TempDir Path tempDir) throws IOException {
+		Path inputFile = tempDir.resolve("input.trig");
+		String input = """
+				@prefix ex: <http://example.com/> .
+				ex:g {
+				  ex:s1 ex:p "value-1111111111" .
+				  ex:s2 ex:p "value-2222222222" .
+				}
+				""";
+		Files.writeString(inputFile, input, StandardCharsets.UTF_8);
+
+		Path outputDir = tempDir.resolve("chunks");
+		int chunkCount = TurtleChunker.writeChunks(inputFile, 1, outputDir, false);
+		assertEquals(2, chunkCount);
+
+		List<Path> chunkFiles = listRegularFiles(outputDir);
+		assertEquals("chunk-00001.trig", chunkFiles.get(0).getFileName().toString());
+		assertEquals("chunk-00002.trig", chunkFiles.get(1).getFileName().toString());
+
+		String first = Files.readString(chunkFiles.get(0), StandardCharsets.UTF_8);
+		String second = Files.readString(chunkFiles.get(1), StandardCharsets.UTF_8);
+		assertTrue(first.contains("ex:g {\nex:s1 ex:p \"value-1111111111\" .\n}\n"));
+		assertTrue(second.contains("ex:g {\nex:s2 ex:p \"value-2222222222\" .\n}\n"));
+		assertEquals(1, countOccurrences(first, "ex:g {"));
+		assertEquals(1, countOccurrences(first, "\n}\n"));
+		assertEquals(1, countOccurrences(second, "ex:g {"));
+		assertEquals(1, countOccurrences(second, "\n}\n"));
+	}
+
+	@Test
+	void writeChunksSupportsDefaultGraphAndGraphKeyword(@TempDir Path tempDir) throws IOException {
+		Path inputFile = tempDir.resolve("input.trig");
+		String input = """
+				@prefix ex: <http://example.com/> .
+				{
+				  ex:default ex:p "default" .
+				}
+				GRAPH ex:g {
+				  ex:named ex:p "named" .
+				} .
+				""";
+		Files.writeString(inputFile, input, StandardCharsets.UTF_8);
+
+		Path outputDir = tempDir.resolve("chunks");
+		int chunkCount = TurtleChunker.writeChunks(inputFile, 1, outputDir, false);
+		assertEquals(2, chunkCount);
+
+		List<Path> chunkFiles = listRegularFiles(outputDir);
+		String first = Files.readString(chunkFiles.get(0), StandardCharsets.UTF_8);
+		String second = Files.readString(chunkFiles.get(1), StandardCharsets.UTF_8);
+		assertTrue(first.contains("{\nex:default ex:p \"default\" .\n}\n"));
+		assertTrue(second.contains("GRAPH ex:g {\nex:named ex:p \"named\" .\n}\n"));
+	}
+
+	@Test
+	void writeChunksIgnoresTrigBracesInLiteralsIrisAndComments(@TempDir Path tempDir) throws IOException {
+		Path inputFile = tempDir.resolve("input.trig");
+		String input = """
+				@prefix ex: <http://example.com/> .
+				ex:g {
+				  ex:s1 ex:p "literal with { brace }" .
+				  ex:s2 ex:p <http://example.com/has{brace}> . # ignored }
+				  ex:s3 ex:p "last" .
+				}
+				""";
+		Files.writeString(inputFile, input, StandardCharsets.UTF_8);
+
+		Path outputDir = tempDir.resolve("chunks");
+		int chunkCount = TurtleChunker.writeChunks(inputFile, 1, outputDir, false);
+		assertEquals(3, chunkCount);
+
+		for (Path chunkFile : listRegularFiles(outputDir)) {
+			String content = Files.readString(chunkFile, StandardCharsets.UTF_8);
+			assertEquals(1, countOccurrences(content, "ex:g {"));
+			assertEquals(1, countOccurrences(content, "\n}\n"));
+		}
+	}
+
+	@Test
+	void writeChunksKeepsTrigBlankNodeStatementsInOneChunkWithGraphContext(@TempDir Path tempDir)
+			throws IOException {
+		Path inputFile = tempDir.resolve("input.trig");
+		String input = """
+				@prefix ex: <http://example.com/> .
+				ex:g1 {
+				  _:shared ex:first "one" .
+				}
+				ex:regular ex:p "regular" .
+				ex:g2 {
+				  ex:s ex:link _:other .
+				}
+				""";
+		Files.writeString(inputFile, input, StandardCharsets.UTF_8);
+
+		Path outputDir = tempDir.resolve("chunks");
+		TurtleChunker.writeChunks(inputFile, 1, outputDir, false);
+
+		List<Path> chunkFiles = listRegularFiles(outputDir);
+		List<Path> blankNodeChunks = chunkFiles.stream()
+				.filter(path -> {
+					try {
+						return Files.readString(path, StandardCharsets.UTF_8).contains("_:");
+					} catch (IOException e) {
+						throw new AssertionError(e);
+					}
+				})
+				.collect(Collectors.toList());
+		assertEquals(1, blankNodeChunks.size(), "TriG blank node statements should share a chunk");
+
+		String blankNodeChunk = Files.readString(blankNodeChunks.getFirst(), StandardCharsets.UTF_8);
+		assertTrue(blankNodeChunk.contains("ex:g1 {\n_:shared ex:first \"one\" .\n}\n"));
+		assertTrue(blankNodeChunk.contains("ex:g2 {\nex:s ex:link _:other .\n}\n"));
+	}
+
+	private static List<Path> listRegularFiles(Path outputDir) throws IOException {
+		try (Stream<Path> paths = Files.list(outputDir)) {
+			return paths
+					.filter(Files::isRegularFile)
+					.sorted(Comparator.comparing(path -> path.getFileName().toString()))
+					.collect(Collectors.toList());
+		}
+	}
+
+	private static int countOccurrences(String value, String needle) {
+		int count = 0;
+		int index = 0;
+		while ((index = value.indexOf(needle, index)) >= 0) {
+			count++;
+			index += needle.length();
+		}
+		return count;
+	}
+
 	private static final class SequenceClock {
 		private final long[] millis;
 		private int index;

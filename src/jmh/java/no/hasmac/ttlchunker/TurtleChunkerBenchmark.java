@@ -28,6 +28,9 @@ import org.openjdk.jmh.annotations.Warmup;
 @State(Scope.Thread)
 public class TurtleChunkerBenchmark {
 
+	@Param({"ttl", "trigLabeledGraph", "trigMixedGraphs"})
+	public String syntax;
+
 	@Param({"0", "100", "1"})
 	public int blankNodeEvery;
 
@@ -45,7 +48,7 @@ public class TurtleChunkerBenchmark {
 	@Setup(Level.Trial)
 	public void setUpTrial() throws IOException {
 		workDir = Files.createTempDirectory("ttl-chunker-jmh-");
-		inputFile = workDir.resolve("input.ttl");
+		inputFile = workDir.resolve(syntax.equals("ttl") ? "input.ttl" : "input.trig");
 		Files.writeString(inputFile, createInput(), StandardCharsets.UTF_8);
 	}
 
@@ -73,6 +76,16 @@ public class TurtleChunkerBenchmark {
 	}
 
 	private String createInput() {
+		if (syntax.equals("trigLabeledGraph")) {
+			return createTrigLabeledGraphInput();
+		}
+		if (syntax.equals("trigMixedGraphs")) {
+			return createTrigMixedGraphsInput();
+		}
+		return createTtlInput();
+	}
+
+	private String createTtlInput() {
 		StringBuilder ttl = new StringBuilder(statements * 48);
 		ttl.append("@prefix ex: <http://example.com/> .\n");
 		for (int i = 0; i < statements; i++) {
@@ -83,6 +96,52 @@ public class TurtleChunkerBenchmark {
 			}
 		}
 		return ttl.toString();
+	}
+
+	private String createTrigLabeledGraphInput() {
+		StringBuilder trig = new StringBuilder(statements * 56);
+		trig.append("@prefix ex: <http://example.com/> .\n");
+		trig.append("ex:g {\n");
+		for (int i = 0; i < statements; i++) {
+			if (blankNodeEvery > 0 && i % blankNodeEvery == 0) {
+				appendBlankNodeStatement(trig, i);
+			} else {
+				appendRegularStatement(trig, i);
+			}
+		}
+		trig.append("}\n");
+		return trig.toString();
+	}
+
+	private String createTrigMixedGraphsInput() {
+		StringBuilder trig = new StringBuilder(statements * 64);
+		trig.append("@prefix ex: <http://example.com/> .\n");
+		for (int i = 0; i < statements; i++) {
+			if (i % 4 == 0) {
+				trig.append("ex:g").append(i % 8).append(" {\n");
+				appendBenchmarkStatement(trig, i);
+				trig.append("}\n");
+			} else if (i % 4 == 1) {
+				trig.append("GRAPH ex:g").append(i % 8).append(" {\n");
+				appendBenchmarkStatement(trig, i);
+				trig.append("} .\n");
+			} else if (i % 4 == 2) {
+				trig.append("{\n");
+				appendBenchmarkStatement(trig, i);
+				trig.append("}\n");
+			} else {
+				appendBenchmarkStatement(trig, i);
+			}
+		}
+		return trig.toString();
+	}
+
+	private void appendBenchmarkStatement(StringBuilder ttl, int statementIndex) {
+		if (blankNodeEvery > 0 && statementIndex % blankNodeEvery == 0) {
+			appendBlankNodeStatement(ttl, statementIndex);
+		} else {
+			appendRegularStatement(ttl, statementIndex);
+		}
 	}
 
 	private static void appendBlankNodeStatement(StringBuilder ttl, int statementIndex) {

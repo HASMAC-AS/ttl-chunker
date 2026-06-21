@@ -59,22 +59,16 @@ Behavior:
 
 ## Benchmarking
 
-Build the JMH benchmark jar:
-
-```bash
-mvn -Pbenchmark -DskipTests package
-```
-
 Run a quick local smoke benchmark:
 
 ```bash
-java -jar target/benchmarks.jar TurtleChunkerBenchmark -wi 1 -i 3 -f 1
+./scripts/run-benchmark.sh no.hasmac.ttlchunker.benchmark.TurtleChunkerBenchmark -wi 1 -i 3 -f 1
 ```
 
 Useful parameters:
 
 ```bash
-java -jar target/benchmarks.jar TurtleChunkerBenchmark \
+./scripts/run-benchmark.sh no.hasmac.ttlchunker.benchmark.TurtleChunkerBenchmark \
   -p syntax=ttl,trigLabeledGraph,trigMixedGraphs \
   -p blankNodeEvery=0,100,1 \
   -p statements=20000 \
@@ -91,8 +85,8 @@ ttl-chunker/
     │   ├── TurtleBlockReader.java                   # Streaming Turtle/TriG block reader
     │   ├── ChunkSink.java                           # Chunk writer + graph wrapping
     │   └── TurtleChunker.java                       # CLI + public facade
-    ├── jmh/java/no/hasmac/ttlchunker/
-    │   └── TurtleChunkerBenchmark.java              # JMH benchmark fixtures
     └── test/java/no/hasmac/ttlchunker/
+        ├── benchmark/
+        │   └── TurtleChunkerBenchmark.java          # JMH benchmark fixtures
         └── TurtleChunkerTest.java                   # Regression coverage
 ```

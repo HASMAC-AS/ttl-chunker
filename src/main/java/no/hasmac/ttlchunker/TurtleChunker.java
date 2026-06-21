@@ -50,7 +50,7 @@ public final class TurtleChunker {
 				System::currentTimeMillis);
 	}
 
-	static int writeChunks(Path inputFile, long approximateChunkSizeBytes, Path outputDir, boolean printStatus)
+	public static int writeChunks(Path inputFile, long approximateChunkSizeBytes, Path outputDir, boolean printStatus)
 			throws IOException {
 		return writeChunks(inputFile, approximateChunkSizeBytes, outputDir, printStatus, System.out,
 				System::currentTimeMillis);

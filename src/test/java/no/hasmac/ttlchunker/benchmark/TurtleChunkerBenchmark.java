@@ -1,4 +1,4 @@
-package no.hasmac.ttlchunker;
+package no.hasmac.ttlchunker.benchmark;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -6,6 +6,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Comparator;
 import java.util.concurrent.TimeUnit;
+import no.hasmac.ttlchunker.TurtleChunker;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
 import org.openjdk.jmh.annotations.Fork;

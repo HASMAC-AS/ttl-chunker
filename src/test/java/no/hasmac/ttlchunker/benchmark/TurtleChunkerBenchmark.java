@@ -39,10 +39,10 @@ public class TurtleChunkerBenchmark {
 	@Param({"0", "100", "1"})
 	public int blankNodeEvery;
 
-	@Param({"20000"})
+	@Param({"1000000"})
 	public int statements;
 
-	@Param({"131072"})
+	@Param({"10485760"})
 	public long chunkSizeBytes;
 
 	private Path workDir;

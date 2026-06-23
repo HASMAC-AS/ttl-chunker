@@ -429,11 +429,15 @@ public final class TurtleChunker {
 	}
 
 	private void parseConsumeWhitespaceOneStep() {
-		if (isTurtleWhitespace(chunkBuf[bufPos])) {
+		int start = bufPos;
+		while (bufPos < bufLen && isTurtleWhitespace(chunkBuf[bufPos])) {
 			bufPos++;
-			chunkStart++;
+		}
+		if (bufPos > start) {
+			chunkStart = bufPos;
 			nextDefaultByteAtTokenBoundary = true;
-		} else {
+		}
+		if (bufPos < bufLen) {
 			state = DEFAULT;
 		}
 	}
@@ -471,12 +475,20 @@ public final class TurtleChunker {
 	}
 
 	private void parseGraphBlockClosedOneStep() {
-		byte b = chunkBuf[bufPos];
-		if (isTurtleWhitespace(b)) {
+		int start = bufPos;
+		while (bufPos < bufLen && isTurtleWhitespace(chunkBuf[bufPos])) {
 			bufPos++;
-			chunkStart++;
+		}
+		if (bufPos > start) {
+			chunkStart = bufPos;
 			nextDefaultByteAtTokenBoundary = true;
-		} else if (b == '.') {
+		}
+		if (bufPos >= bufLen) {
+			return;
+		}
+
+		byte b = chunkBuf[bufPos];
+		if (b == '.') {
 			bufPos++;
 			chunkStart++;
 			state = CONSUME_WHITESPACE;

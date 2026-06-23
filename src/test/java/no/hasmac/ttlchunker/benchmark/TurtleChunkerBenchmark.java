@@ -20,6 +20,10 @@ import org.openjdk.jmh.annotations.Setup;
 import org.openjdk.jmh.annotations.State;
 import org.openjdk.jmh.annotations.TearDown;
 import org.openjdk.jmh.annotations.Warmup;
+import org.openjdk.jmh.runner.Runner;
+import org.openjdk.jmh.runner.options.CommandLineOptions;
+import org.openjdk.jmh.runner.options.Options;
+import org.openjdk.jmh.runner.options.OptionsBuilder;
 
 @BenchmarkMode(Mode.Throughput)
 @OutputTimeUnit(TimeUnit.SECONDS)
@@ -45,6 +49,15 @@ public class TurtleChunkerBenchmark {
 	private Path inputFile;
 	private Path lastOutputDir;
 	private int invocation;
+
+	public static void main(String[] args) throws Exception {
+		Options options = new OptionsBuilder()
+				.include(TurtleChunkerBenchmark.class.getName())
+				.parent(new CommandLineOptions(args))
+				.forks(0)
+				.build();
+		new Runner(options).run();
+	}
 
 	@Setup(Level.Trial)
 	public void setUpTrial() throws IOException {

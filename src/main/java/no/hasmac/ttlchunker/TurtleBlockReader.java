@@ -22,9 +22,10 @@ final class TurtleBlockReader {
 	private static final byte QUOTE_START_SECOND = 10;
 	private static final byte BLANK_NODE_LABEL = 11;
 	private static final byte GRAPH_BLOCK_CLOSED = 12;
+	private static final boolean[] TOKEN_BOUNDARY_AFTER = tokenBoundaryAfterTable();
 
 	private final InputStream in;
-	private final byte[] chunkBuf = new byte[BUFFER_SIZE];
+	private final byte[] chunkBuf;
 	private final ByteAccumulator partialBytes = new ByteAccumulator(PARTIAL_BUFFER_INITIAL_SIZE);
 
 	private int bufPos;
@@ -55,10 +56,18 @@ final class TurtleBlockReader {
 	private byte[] pendingGraphHeader;
 
 	TurtleBlockReader(InputStream in) {
+		this(in, BUFFER_SIZE);
+	}
+
+	TurtleBlockReader(InputStream in, int bufferSize) {
 		if (in == null) {
 			throw new NullPointerException();
 		}
+		if (bufferSize <= 0) {
+			throw new IllegalArgumentException("Buffer size must be greater than zero");
+		}
 		this.in = in;
+		chunkBuf = new byte[bufferSize];
 	}
 
 	void forEachBlock(TurtleChunker.BlockConsumer consumer) throws IOException {
@@ -177,11 +186,9 @@ final class TurtleBlockReader {
 				currentBlockIsPrefixOrBase = true;
 				state = PREFIX_OR_BASE;
 			}
-			default -> {
-				if (!isTurtleWhitespace(b)) {
-					seenNonIgnorableInBlock = true;
-				}
+			case ' ', '\t', '\n', '\r' -> {
 			}
+			default -> seenNonIgnorableInBlock = true;
 		}
 
 		nextDefaultByteAtTokenBoundary = isTokenBoundaryAfter(b);
@@ -547,11 +554,20 @@ final class TurtleBlockReader {
 	}
 
 	private static boolean isTokenBoundaryAfter(byte b) {
-		return isTurtleWhitespace(b)
-				|| b == '('
-				|| b == '['
-				|| b == ','
-				|| b == ';';
+		return TOKEN_BOUNDARY_AFTER[b & 0xff];
+	}
+
+	private static boolean[] tokenBoundaryAfterTable() {
+		boolean[] table = new boolean[256];
+		table[' '] = true;
+		table['\t'] = true;
+		table['\n'] = true;
+		table['\r'] = true;
+		table['('] = true;
+		table['['] = true;
+		table[','] = true;
+		table[';'] = true;
+		return table;
 	}
 
 	private static boolean isBlankNodeLabelFirstChar(byte b) {

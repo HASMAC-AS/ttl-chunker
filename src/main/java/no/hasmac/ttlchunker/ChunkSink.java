@@ -60,6 +60,7 @@ final class ChunkSink implements TurtleChunker.BlockConsumer, AutoCloseable {
 		if (prefixOrBase) {
 			prefixes.write(bytes, offset, length);
 			prefixes.write('\n');
+			writeDirectiveToOpenChunks(bytes, offset, length);
 			return;
 		}
 
@@ -97,6 +98,24 @@ final class ChunkSink implements TurtleChunker.BlockConsumer, AutoCloseable {
 		blankNodeOutput.write(bytes, offset, length);
 		blankNodeOutput.write('\n');
 		statements++;
+	}
+
+	private void writeDirectiveToOpenChunks(byte[] bytes, int offset, int length) throws IOException {
+		if (currentOutput != null) {
+			currentChunkBytes += closeCurrentGraph();
+			currentOutput.write(bytes, offset, length);
+			currentOutput.write('\n');
+			currentChunkBytes += length + 1L;
+			if (currentChunkBytes > approximateChunkSizeBytes) {
+				closeCurrentOutput();
+			}
+		}
+
+		if (blankNodeOutput != null) {
+			closeBlankNodeGraph();
+			blankNodeOutput.write(bytes, offset, length);
+			blankNodeOutput.write('\n');
+		}
 	}
 
 	private void openNextChunk() throws IOException {

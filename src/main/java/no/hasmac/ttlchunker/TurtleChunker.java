@@ -1,6 +1,5 @@
 package no.hasmac.ttlchunker;
 
-import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -30,9 +29,23 @@ public final class TurtleChunker {
 	private static final byte QUOTE_START_SECOND = 10;
 	private static final byte BLANK_NODE_LABEL = 11;
 	private static final byte GRAPH_BLOCK_CLOSED = 12;
+	private static final StateHandler[] STATE_HANDLERS = stateHandlers();
 	private static final DefaultByteHandler[] DEFAULT_BYTE_HANDLERS = defaultByteHandlers();
-	private static final boolean[] TURTLE_WHITESPACE = turtleWhitespaceTable();
-	private static final boolean[] TOKEN_BOUNDARY_AFTER = tokenBoundaryAfterTable();
+
+	private static final long TURTLE_WS_MASK =
+			(1L << 0x09) |   // '\t'
+					(1L << 0x0A) |   // '\n'
+					(1L << 0x0D) |   // '\r'
+					(1L << 0x20);    // ' '
+
+	private static final long TOKEN_BOUNDARY_LOW =
+			(1L << 0x09) |   // '\t'
+					(1L << 0x0A) |   // '\n'
+					(1L << 0x0D) |   // '\r'
+					(1L << 0x20) |   // ' '
+					(1L << 0x28) |   // '('
+					(1L << 0x2C) |   // ','
+					(1L << 0x3B);    // ';'
 
 	private final InputStream in;
 	private final byte[] chunkBuf;
@@ -145,7 +158,7 @@ public final class TurtleChunker {
 
 		int chunkCount;
 		long statementCount;
-		try (InputStream inputStream = new BufferedInputStream(Files.newInputStream(inputFile), BUFFER_SIZE)) {
+		try (InputStream inputStream = Files.newInputStream(inputFile)) {
 			TurtleChunker chunker = new TurtleChunker(inputStream, readBufferSize);
 			chunker.writeChunksTo(outputDir, approximateChunkSizeBytes, printStatus, statusOutput,
 					currentTimeMillis, chunkFileExtension(inputFile));
@@ -241,22 +254,7 @@ public final class TurtleChunker {
 				return emitLeftoverAtEof();
 			}
 
-			switch (state) {
-				case DEFAULT -> parseDefaultOneStep();
-				case PERIOD_PENDING -> parsePeriodOneStep();
-				case IRI -> parseIriOneStep();
-				case LITERAL -> parseLiteralOneStep();
-				case MULTILINE_LITERAL -> parseMultilineLiteralOneStep();
-				case LANG_TAG_OR_DATATYPE -> parseLangTagOrDatatypeOneStep();
-				case PREFIX_OR_BASE -> parsePrefixOrBaseOneStep();
-				case CONSUME_WHITESPACE -> parseConsumeWhitespaceOneStep();
-				case COMMENT -> parseCommentOneStep();
-				case QUOTE_START -> parseQuoteStartOneStep();
-				case QUOTE_START_SECOND -> parseQuoteStartSecondOneStep();
-				case BLANK_NODE_LABEL -> parseBlankNodeLabelOneStep();
-				case GRAPH_BLOCK_CLOSED -> parseGraphBlockClosedOneStep();
-				default -> throw new TurtleSyntaxException();
-			}
+			STATE_HANDLERS[state].handle(this);
 
 			if (pendingBytes != null && emitPending()) {
 				return true;
@@ -264,30 +262,66 @@ public final class TurtleChunker {
 		}
 	}
 
-	private void parseDefaultOneStep() throws IOException {
-		byte b = chunkBuf[bufPos++];
-		boolean tokenBoundaryBeforeByte = nextDefaultByteAtTokenBoundary;
+	private void parseDefaultRun() throws IOException {
+		byte[] buf = chunkBuf;
+		int p = bufPos;
+		int len = bufLen;
 
-		DefaultByteHandler handler = DEFAULT_BYTE_HANDLERS[b & 0xff];
-		boolean updateTokenBoundary;
-		if (handler == null) {
-			seenNonIgnorableInBlock = true;
-			updateTokenBoundary = true;
-		} else {
-			updateTokenBoundary = handler.handle(this, b, tokenBoundaryBeforeByte);
+		while (p < len) {
+			int runStart = p;
+			int c;
+			DefaultByteHandler handler;
+			while (true) {
+				if (p >= len) {
+					if (p > runStart) {
+						seenNonIgnorableInBlock = true;
+						nextDefaultByteAtTokenBoundary = false;
+					}
+					bufPos = p;
+					return;
+				}
+
+				c = buf[p] & 0xff;
+				handler = DEFAULT_BYTE_HANDLERS[c];
+				if (handler != null) {
+					break;
+				}
+				p++;
+			}
+
+			if (p > runStart) {
+				seenNonIgnorableInBlock = true;
+				nextDefaultByteAtTokenBoundary = false;
+			}
+
+			boolean tokenBoundaryBeforeByte = nextDefaultByteAtTokenBoundary;
+			bufPos = p + 1;
+			handler.handle(this, c, tokenBoundaryBeforeByte);
+
+			if (state != DEFAULT || pendingBytes != null) {
+				return;
+			}
+
+			buf = chunkBuf;
+			p = bufPos;
+			len = bufLen;
 		}
-		if (updateTokenBoundary) {
-			nextDefaultByteAtTokenBoundary = isTokenBoundaryAfter(b);
-		}
+
+		bufPos = p;
 	}
 
 	private void parseIriOneStep() {
-		while (bufPos < bufLen) {
-			if (chunkBuf[bufPos++] == '>') {
+		byte[] buf = chunkBuf;
+		int p = bufPos;
+		int len = bufLen;
+		while (p < len) {
+			if (buf[p++] == '>') {
+				bufPos = p;
 				state = DEFAULT;
 				return;
 			}
 		}
+		bufPos = p;
 	}
 
 	private void parseQuoteStartOneStep() {
@@ -309,58 +343,79 @@ public final class TurtleChunker {
 	}
 
 	private void parseLiteralOneStep() {
-		while (bufPos < bufLen) {
-			byte b = chunkBuf[bufPos++];
+		byte[] buf = chunkBuf;
+		int p = bufPos;
+		int len = bufLen;
+		byte delimiter = literalDelimiter;
+		int slashParity = consecutiveBackslashes & 1;
+
+		while (p < len) {
+			byte b = buf[p++];
 			if (b == '\\') {
-				consecutiveBackslashes++;
+				slashParity ^= 1;
 				continue;
 			}
 
-			boolean escaped = (consecutiveBackslashes & 1) != 0;
-			consecutiveBackslashes = 0;
+			boolean escaped = slashParity != 0;
+			slashParity = 0;
 
-			if (b == literalDelimiter && !escaped) {
+			if (b == delimiter && !escaped) {
+				bufPos = p;
+				consecutiveBackslashes = 0;
 				state = LANG_TAG_OR_DATATYPE;
 				return;
 			}
 		}
+
+		bufPos = p;
+		consecutiveBackslashes = slashParity;
 	}
 
 	private void parseMultilineLiteralOneStep() throws IOException {
-		while (bufPos < bufLen) {
-			byte b = chunkBuf[bufPos++];
+		byte[] buf = chunkBuf;
+		int p = bufPos;
+		int len = bufLen;
+		byte delimiter = literalDelimiter;
+		int slashParity = consecutiveBackslashes & 1;
+
+		while (p < len) {
+			byte b = buf[p++];
 			if (b == '\\') {
-				consecutiveBackslashes++;
+				slashParity ^= 1;
 				continue;
 			}
 
-			boolean escaped = (consecutiveBackslashes & 1) != 0;
-			consecutiveBackslashes = 0;
+			boolean escaped = slashParity != 0;
+			slashParity = 0;
 
-			if (b == literalDelimiter && !escaped && checkForTripleQuote(literalDelimiter)) {
-				state = LANG_TAG_OR_DATATYPE;
-				return;
+			if (b == delimiter && !escaped) {
+				bufPos = p;
+				consecutiveBackslashes = 0;
+				if (checkForTripleQuote(delimiter)) {
+					state = LANG_TAG_OR_DATATYPE;
+					return;
+				}
+				buf = chunkBuf;
+				p = bufPos;
+				len = bufLen;
 			}
 		}
+
+		bufPos = p;
+		consecutiveBackslashes = slashParity;
 	}
 
 	private void parseLangTagOrDatatypeOneStep() {
 		byte b = chunkBuf[bufPos];
-
-		if (b == '@') {
+		if (b == '@' || b == '^') {
 			bufPos++;
-			state = DEFAULT;
-		} else if (b == '^') {
-			bufPos++;
-			state = DEFAULT;
-		} else {
-			state = DEFAULT;
 		}
+		state = DEFAULT;
 	}
 
 	private void parsePrefixOrBaseOneStep() {
-		byte b = chunkBuf[bufPos++];
-		if (b != 'p' && b != 'P' && b != 'b' && b != 'B') {
+		int c = (chunkBuf[bufPos++] & 0xff) | 0x20;
+		if (c != 'p' && c != 'b') {
 			throw new TurtleSyntaxException();
 		}
 		state = DEFAULT;
@@ -368,27 +423,31 @@ public final class TurtleChunker {
 
 	private void parseConsumeWhitespaceOneStep() {
 		int start = bufPos;
-		while (bufPos < bufLen && isTurtleWhitespace(chunkBuf[bufPos])) {
-			bufPos++;
-		}
-		if (bufPos > start) {
-			chunkStart = bufPos;
+		int p = skipTurtleWhitespace(chunkBuf, start, bufLen);
+		bufPos = p;
+		if (p > start) {
+			chunkStart = p;
 			nextDefaultByteAtTokenBoundary = true;
 		}
-		if (bufPos < bufLen) {
+		if (p < bufLen) {
 			state = DEFAULT;
 		}
 	}
 
 	private void parseCommentOneStep() {
-		while (bufPos < bufLen) {
-			byte b = chunkBuf[bufPos++];
+		byte[] buf = chunkBuf;
+		int p = bufPos;
+		int len = bufLen;
+		while (p < len) {
+			byte b = buf[p++];
 			if (b == '\n' || b == '\r') {
+				bufPos = p;
 				nextDefaultByteAtTokenBoundary = true;
 				state = DEFAULT;
 				return;
 			}
 		}
+		bufPos = p;
 	}
 
 	private void parseBlankNodeLabelOneStep() {
@@ -414,20 +473,19 @@ public final class TurtleChunker {
 
 	private void parseGraphBlockClosedOneStep() {
 		int start = bufPos;
-		while (bufPos < bufLen && isTurtleWhitespace(chunkBuf[bufPos])) {
-			bufPos++;
-		}
-		if (bufPos > start) {
-			chunkStart = bufPos;
+		int p = skipTurtleWhitespace(chunkBuf, start, bufLen);
+		bufPos = p;
+		if (p > start) {
+			chunkStart = p;
 			nextDefaultByteAtTokenBoundary = true;
 		}
-		if (bufPos >= bufLen) {
+		if (p >= bufLen) {
 			return;
 		}
 
-		byte b = chunkBuf[bufPos];
+		byte b = chunkBuf[p];
 		if (b == '.') {
-			bufPos++;
+			bufPos = p + 1;
 			chunkStart++;
 			state = CONSUME_WHITESPACE;
 		} else {
@@ -457,9 +515,8 @@ public final class TurtleChunker {
 	}
 
 	private void parsePeriodOneStep() {
-		byte next = chunkBuf[bufPos];
+		int next = chunkBuf[bufPos] & 0xff;
 		state = DEFAULT;
-
 		if (isTurtleWhitespace(next)) {
 			finalizeBlock();
 		}
@@ -535,12 +592,8 @@ public final class TurtleChunker {
 		pendingBlankNodeLabel = false;
 		pendingGraphHeader = null;
 
-		while (offset < end && isTurtleWhitespace(bytes[offset])) {
-			offset++;
-		}
-		while (end > offset && isTurtleWhitespace(bytes[end - 1])) {
-			end--;
-		}
+		offset = skipTurtleWhitespace(bytes, offset, end);
+		end = trimTrailingTurtleWhitespace(bytes, offset, end);
 
 		state = CONSUME_WHITESPACE;
 		resetBlockFlags();
@@ -591,23 +644,21 @@ public final class TurtleChunker {
 	}
 
 	private byte[] copyCurrentBlockTrimmed(int endExclusive) {
+		if (partialSize == 0) {
+			int start = skipTurtleWhitespace(chunkBuf, chunkStart, endExclusive);
+			int end = trimTrailingTurtleWhitespace(chunkBuf, start, endExclusive);
+			return Arrays.copyOfRange(chunkBuf, start, end);
+		}
+
 		int currentLength = endExclusive - chunkStart;
 		byte[] bytes = new byte[partialSize + currentLength];
-		if (partialSize > 0) {
-			System.arraycopy(partialBytes, 0, bytes, 0, partialSize);
-		}
+		System.arraycopy(partialBytes, 0, bytes, 0, partialSize);
 		if (currentLength > 0) {
 			System.arraycopy(chunkBuf, chunkStart, bytes, partialSize, currentLength);
 		}
 
-		int start = 0;
-		int end = bytes.length;
-		while (start < end && isTurtleWhitespace(bytes[start])) {
-			start++;
-		}
-		while (end > start && isTurtleWhitespace(bytes[end - 1])) {
-			end--;
-		}
+		int start = skipTurtleWhitespace(bytes, 0, bytes.length);
+		int end = trimTrailingTurtleWhitespace(bytes, start, bytes.length);
 		return Arrays.copyOfRange(bytes, start, end);
 	}
 
@@ -728,7 +779,7 @@ public final class TurtleChunker {
 	}
 
 	private long writeChunkHeader(OutputStream output) throws IOException {
-		int length = trimTrailingTurtleWhitespace(prefixBytes, prefixSize);
+		int length = trimTrailingTurtleWhitespace(prefixBytes, 0, prefixSize);
 		if (length == 0) {
 			return 0;
 		}
@@ -903,104 +954,165 @@ public final class TurtleChunker {
 		return Arrays.copyOf(bytes, newCapacity);
 	}
 
+
+	@FunctionalInterface
+	private interface StateHandler {
+		void handle(TurtleChunker chunker) throws IOException;
+	}
+
+	private static StateHandler[] stateHandlers() {
+		StateHandler[] handlers = new StateHandler[GRAPH_BLOCK_CLOSED + 1];
+		handlers[DEFAULT] = TurtleChunker::parseDefaultRun;
+		handlers[PERIOD_PENDING] = TurtleChunker::parsePeriodOneStep;
+		handlers[IRI] = TurtleChunker::parseIriOneStep;
+		handlers[LITERAL] = TurtleChunker::parseLiteralOneStep;
+		handlers[MULTILINE_LITERAL] = TurtleChunker::parseMultilineLiteralOneStep;
+		handlers[LANG_TAG_OR_DATATYPE] = TurtleChunker::parseLangTagOrDatatypeOneStep;
+		handlers[PREFIX_OR_BASE] = TurtleChunker::parsePrefixOrBaseOneStep;
+		handlers[CONSUME_WHITESPACE] = TurtleChunker::parseConsumeWhitespaceOneStep;
+		handlers[COMMENT] = TurtleChunker::parseCommentOneStep;
+		handlers[QUOTE_START] = TurtleChunker::parseQuoteStartOneStep;
+		handlers[QUOTE_START_SECOND] = TurtleChunker::parseQuoteStartSecondOneStep;
+		handlers[BLANK_NODE_LABEL] = TurtleChunker::parseBlankNodeLabelOneStep;
+		handlers[GRAPH_BLOCK_CLOSED] = TurtleChunker::parseGraphBlockClosedOneStep;
+		return handlers;
+	}
+
 	@FunctionalInterface
 	private interface DefaultByteHandler {
-		boolean handle(TurtleChunker chunker, byte b, boolean tokenBoundaryBeforeByte) throws IOException;
+		void handle(TurtleChunker chunker, int c, boolean tokenBoundaryBeforeByte) throws IOException;
 	}
 
 	private static DefaultByteHandler[] defaultByteHandlers() {
-		DefaultByteHandler whitespaceHandler = (chunker, b, tokenBoundaryBeforeByte) -> true;
-		DefaultByteHandler quoteHandler = (chunker, b, tokenBoundaryBeforeByte) -> {
+		DefaultByteHandler whitespaceHandler = (chunker, c, tokenBoundaryBeforeByte) -> {
+			chunker.bufPos = skipTurtleWhitespace(chunker.chunkBuf, chunker.bufPos, chunker.bufLen);
+			chunker.nextDefaultByteAtTokenBoundary = true;
+		};
+
+		DefaultByteHandler quoteHandler = (chunker, c, tokenBoundaryBeforeByte) -> {
 			chunker.seenNonIgnorableInBlock = true;
-			chunker.literalDelimiter = b;
+			chunker.literalDelimiter = (byte) c;
+			chunker.nextDefaultByteAtTokenBoundary = false;
 			chunker.state = QUOTE_START;
-			return true;
 		};
 
 		DefaultByteHandler[] handlers = new DefaultByteHandler[256];
-		handlers['<'] = (chunker, b, tokenBoundaryBeforeByte) -> {
+
+		handlers[' '] = whitespaceHandler;
+		handlers['\t'] = whitespaceHandler;
+		handlers['\n'] = whitespaceHandler;
+		handlers['\r'] = whitespaceHandler;
+
+		handlers['<'] = (chunker, c, tokenBoundaryBeforeByte) -> {
 			chunker.seenNonIgnorableInBlock = true;
+			chunker.nextDefaultByteAtTokenBoundary = false;
 			chunker.state = IRI;
-			return true;
 		};
-		handlers['#'] = (chunker, b, tokenBoundaryBeforeByte) -> {
+
+		handlers['#'] = (chunker, c, tokenBoundaryBeforeByte) -> {
+			chunker.nextDefaultByteAtTokenBoundary = false;
 			chunker.state = COMMENT;
-			return true;
 		};
-		handlers['('] = (chunker, b, tokenBoundaryBeforeByte) -> {
+
+		handlers['('] = (chunker, c, tokenBoundaryBeforeByte) -> {
 			chunker.seenNonIgnorableInBlock = true;
 			chunker.pushNesting((byte) '(');
-			return true;
+			chunker.nextDefaultByteAtTokenBoundary = true;
 		};
-		handlers[')'] = (chunker, b, tokenBoundaryBeforeByte) -> {
+
+		handlers[')'] = (chunker, c, tokenBoundaryBeforeByte) -> {
 			chunker.seenNonIgnorableInBlock = true;
 			chunker.popNesting();
-			return true;
+			chunker.nextDefaultByteAtTokenBoundary = false;
 		};
-		handlers['['] = (chunker, b, tokenBoundaryBeforeByte) -> {
+
+		handlers['['] = (chunker, c, tokenBoundaryBeforeByte) -> {
 			chunker.seenNonIgnorableInBlock = true;
 			chunker.pushNesting((byte) '[');
-			return true;
+			chunker.nextDefaultByteAtTokenBoundary = true;
 		};
-		handlers['{'] = (chunker, b, tokenBoundaryBeforeByte) -> {
+
+		handlers[']'] = (chunker, c, tokenBoundaryBeforeByte) -> {
+			chunker.seenNonIgnorableInBlock = true;
+			chunker.popNesting();
+			chunker.nextDefaultByteAtTokenBoundary = false;
+		};
+
+		handlers['{'] = (chunker, c, tokenBoundaryBeforeByte) -> {
 			chunker.seenNonIgnorableInBlock = true;
 			if (chunker.nestingDepth == 0) {
 				chunker.startGraphBlock();
-				return false;
+				return;
 			}
-			return true;
+			chunker.nextDefaultByteAtTokenBoundary = false;
 		};
-		handlers['}'] = (chunker, b, tokenBoundaryBeforeByte) -> {
+
+		handlers['}'] = (chunker, c, tokenBoundaryBeforeByte) -> {
 			if (chunker.inGraphBlock && chunker.nestingDepth == 0) {
 				if (chunker.seenNonIgnorableInBlock) {
 					throw new TurtleSyntaxException();
 				}
 				chunker.closeGraphBlock();
-				return false;
+				return;
 			}
 			chunker.seenNonIgnorableInBlock = true;
-			return true;
+			chunker.nextDefaultByteAtTokenBoundary = false;
 		};
-		handlers[']'] = (chunker, b, tokenBoundaryBeforeByte) -> {
-			chunker.seenNonIgnorableInBlock = true;
-			chunker.popNesting();
-			return true;
-		};
+
 		handlers['\''] = quoteHandler;
 		handlers['"'] = quoteHandler;
-		handlers['.'] = (chunker, b, tokenBoundaryBeforeByte) -> {
+
+		handlers['.'] = (chunker, c, tokenBoundaryBeforeByte) -> {
 			chunker.seenNonIgnorableInBlock = true;
-			if (chunker.nestingDepth == 0) {
-				chunker.state = PERIOD_PENDING;
+			chunker.nextDefaultByteAtTokenBoundary = false;
+			if (chunker.nestingDepth != 0) {
+				return;
 			}
-			return true;
+			if (chunker.bufPos >= chunker.bufLen) {
+				chunker.state = PERIOD_PENDING;
+				return;
+			}
+			if (isTurtleWhitespace(chunker.chunkBuf[chunker.bufPos] & 0xff)) {
+				chunker.finalizeBlock();
+			}
 		};
-		handlers['\\'] = (chunker, b, tokenBoundaryBeforeByte) -> {
+
+		handlers['\\'] = (chunker, c, tokenBoundaryBeforeByte) -> {
 			chunker.seenNonIgnorableInBlock = true;
-			chunker.skipEscapedByteInDefault();
-			return true;
+			chunker.nextDefaultByteAtTokenBoundary = false;
+			if (chunker.bufPos < chunker.bufLen) {
+				chunker.bufPos++;
+			} else {
+				chunker.skipEscapedByteInDefault();
+			}
 		};
-		handlers['_'] = (chunker, b, tokenBoundaryBeforeByte) -> {
+
+		handlers['_'] = (chunker, c, tokenBoundaryBeforeByte) -> {
 			chunker.seenNonIgnorableInBlock = true;
+			chunker.nextDefaultByteAtTokenBoundary = false;
 			if (tokenBoundaryBeforeByte) {
 				chunker.blankNodeLabelColonSeen = false;
 				chunker.state = BLANK_NODE_LABEL;
 			}
-			return true;
 		};
-		handlers['@'] = (chunker, b, tokenBoundaryBeforeByte) -> {
+
+		handlers['@'] = (chunker, c, tokenBoundaryBeforeByte) -> {
 			if (chunker.seenNonIgnorableInBlock) {
 				throw new TurtleSyntaxException();
 			}
 			chunker.seenNonIgnorableInBlock = true;
 			chunker.currentBlockIsPrefixOrBase = true;
+			chunker.nextDefaultByteAtTokenBoundary = false;
 			chunker.state = PREFIX_OR_BASE;
-			return true;
 		};
-		handlers[' '] = whitespaceHandler;
-		handlers['\t'] = whitespaceHandler;
-		handlers['\n'] = whitespaceHandler;
-		handlers['\r'] = whitespaceHandler;
+
+		DefaultByteHandler boundaryHandler = (chunker, c, tokenBoundaryBeforeByte) -> {
+			chunker.seenNonIgnorableInBlock = true;
+			chunker.nextDefaultByteAtTokenBoundary = true;
+		};
+		handlers[','] = boundaryHandler;
+		handlers[';'] = boundaryHandler;
+
 		return handlers;
 	}
 
@@ -1122,48 +1234,44 @@ public final class TurtleChunker {
 		return true;
 	}
 
-	private static int trimTrailingTurtleWhitespace(byte[] bytes, int length) {
-		while (length > 0 && isTurtleWhitespace(bytes[length - 1])) {
-			length--;
+	private static int skipTurtleWhitespace(byte[] bytes, int offset, int end) {
+		while (offset < end) {
+			int c = bytes[offset] & 0xff;
+			if (!isTurtleWhitespace(c)) {
+				break;
+			}
+			offset++;
 		}
-		return length;
+		return offset;
 	}
 
-	private static final long TURTLE_WS_MASK =
-			(1L << 0x09) |   // '\t'
-					(1L << 0x0A) |   // '\n'
-					(1L << 0x0D) |   // '\r'
-					(1L << 0x20);    // ' '
+	private static int trimTrailingTurtleWhitespace(byte[] bytes, int start, int end) {
+		while (end > start && isTurtleWhitespace(bytes[end - 1] & 0xff)) {
+			end--;
+		}
+		return end;
+	}
+
+	private static int trimTrailingTurtleWhitespace(byte[] bytes, int length) {
+		return trimTrailingTurtleWhitespace(bytes, 0, length);
+	}
 
 	private static boolean isTurtleWhitespace(byte b) {
-		int c = b & 0xFF; // unsigned byte
+		return isTurtleWhitespace(b & 0xff);
+	}
+
+	private static boolean isTurtleWhitespace(int c) {
 		return c <= 0x20 && ((TURTLE_WS_MASK >>> c) & 1L) != 0;
 	}
 
-	private static boolean[] turtleWhitespaceTable() {
-		boolean[] table = new boolean[256];
-		table[' '] = true;
-		table['\t'] = true;
-		table['\n'] = true;
-		table['\r'] = true;
-		return table;
-	}
-
 	private static boolean isTokenBoundaryAfter(byte b) {
-		return TOKEN_BOUNDARY_AFTER[b & 0xff];
+		return isTokenBoundaryAfter(b & 0xff);
 	}
 
-	private static boolean[] tokenBoundaryAfterTable() {
-		boolean[] table = new boolean[256];
-		table[' '] = true;
-		table['\t'] = true;
-		table['\n'] = true;
-		table['\r'] = true;
-		table['('] = true;
-		table['['] = true;
-		table[','] = true;
-		table[';'] = true;
-		return table;
+	private static boolean isTokenBoundaryAfter(int c) {
+		return c < 64
+				? ((TOKEN_BOUNDARY_LOW >>> c) & 1L) != 0
+				: c == '[';
 	}
 
 	private static boolean isBlankNodeLabelFirstChar(byte b) {
@@ -1179,7 +1287,7 @@ public final class TurtleChunker {
 	}
 
 	private static boolean isAsciiBlank(char c) {
-		return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+		return c <= 0x20 && ((TURTLE_WS_MASK >>> c) & 1L) != 0;
 	}
 
 	private static void printSeconds(PrintStream output, long elapsedMillis) {

@@ -14,7 +14,7 @@ import org.eclipse.rdf4j.rio.RDFFormat;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-class ChunkSinkDirectiveTest {
+class TurtleChunkerDirectiveTest {
 
 	@Test
 	void latePrefixIsWrittenToAlreadyOpenTurtleChunk(@TempDir Path tempDir) throws IOException {

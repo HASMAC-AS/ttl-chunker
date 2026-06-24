@@ -1,10 +1,11 @@
 package no.hasmac.ttlchunker;
 
-import java.io.BufferedOutputStream;
+import java.io.OutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.io.PrintStream;
+import java.lang.reflect.Field;
+import sun.misc.Unsafe;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
@@ -16,27 +17,54 @@ public final class TurtleChunker {
 	private static final int PARTIAL_BUFFER_INITIAL_SIZE = 64 * 1024;
 	private static final int PREFIX_BUFFER_INITIAL_SIZE = 8 * 1024;
 
-	private static final byte DEFAULT = 0;
-	private static final byte PERIOD_PENDING = 1;
-	private static final byte IRI = 2;
-	private static final byte LITERAL = 3;
-	private static final byte MULTILINE_LITERAL = 4;
-	private static final byte LANG_TAG_OR_DATATYPE = 5;
-	private static final byte PREFIX_OR_BASE = 6;
-	private static final byte CONSUME_WHITESPACE = 7;
-	private static final byte COMMENT = 8;
-	private static final byte QUOTE_START = 9;
-	private static final byte QUOTE_START_SECOND = 10;
-	private static final byte BLANK_NODE_LABEL = 11;
-	private static final byte GRAPH_BLOCK_CLOSED = 12;
-	private static final StateHandler[] STATE_HANDLERS = stateHandlers();
-	private static final DefaultByteHandler[] DEFAULT_BYTE_HANDLERS = defaultByteHandlers();
+	private static final int DEFAULT = 0;
+	private static final int PERIOD_PENDING = 1;
+	private static final int IRI = 2;
+	private static final int LITERAL = 3;
+	private static final int MULTILINE_LITERAL = 4;
+	private static final int LANG_TAG_OR_DATATYPE = 5;
+	private static final int PREFIX_OR_BASE = 6;
+	private static final int CONSUME_WHITESPACE = 7;
+	private static final int COMMENT = 8;
+	private static final int QUOTE_START = 9;
+	private static final int QUOTE_START_SECOND = 10;
+	private static final int BLANK_NODE_LABEL = 11;
+	private static final int GRAPH_BLOCK_CLOSED = 12;
+	private static final byte DEFAULT_ACTION_ORDINARY = 0;
+	private static final byte DEFAULT_ACTION_WHITESPACE = 1;
+	private static final byte DEFAULT_ACTION_IRI = 2;
+	private static final byte DEFAULT_ACTION_COMMENT = 3;
+	private static final byte DEFAULT_ACTION_OPEN_PAREN = 4;
+	private static final byte DEFAULT_ACTION_CLOSE_PAREN = 5;
+	private static final byte DEFAULT_ACTION_OPEN_BRACKET = 6;
+	private static final byte DEFAULT_ACTION_CLOSE_BRACKET = 7;
+	private static final byte DEFAULT_ACTION_OPEN_GRAPH = 8;
+	private static final byte DEFAULT_ACTION_CLOSE_GRAPH = 9;
+	private static final byte DEFAULT_ACTION_QUOTE = 10;
+	private static final byte DEFAULT_ACTION_PERIOD = 11;
+	private static final byte DEFAULT_ACTION_BACKSLASH = 12;
+	private static final byte DEFAULT_ACTION_UNDERSCORE = 13;
+	private static final byte DEFAULT_ACTION_DIRECTIVE = 14;
+	private static final byte DEFAULT_ACTION_TOKEN_BOUNDARY = 15;
+
+	private static final byte[] DEFAULT_BYTE_ACTIONS = defaultByteActions();
 
 	private static final long TURTLE_WS_MASK =
 			(1L << 0x09) |   // '\t'
 					(1L << 0x0A) |   // '\n'
 					(1L << 0x0D) |   // '\r'
 					(1L << 0x20);    // ' '
+
+	private static final byte[] CLOSE_GRAPH_BYTES = { '}', '\n' };
+
+	private static final Unsafe UNSAFE = unsafe();
+	private static final long BYTE_ARRAY_BASE_OFFSET = UNSAFE.arrayBaseOffset(byte[].class);
+	private static final long BYTE_HIGH_BITS = 0x8080808080808080L;
+	private static final long BYTE_LOW_BITS = 0x0101010101010101L;
+	private static final long BACKSLASH_WORD = repeatedByte('\\');
+	private static final long GREATER_THAN_WORD = repeatedByte('>');
+	private static final long LF_WORD = repeatedByte('\n');
+	private static final long CR_WORD = repeatedByte('\r');
 
 	private static final long TOKEN_BOUNDARY_LOW =
 			(1L << 0x09) |   // '\t'
@@ -49,6 +77,7 @@ public final class TurtleChunker {
 
 	private final InputStream in;
 	private final byte[] chunkBuf;
+	private final int readLimit;
 
 	private byte[] partialBytes = new byte[PARTIAL_BUFFER_INITIAL_SIZE];
 	private int partialSize;
@@ -63,7 +92,7 @@ public final class TurtleChunker {
 	private boolean nextDefaultByteAtTokenBoundary = true;
 	private boolean inGraphBlock;
 
-	private byte state = DEFAULT;
+	private int state = DEFAULT;
 	private byte literalDelimiter;
 	private int consecutiveBackslashes;
 	private boolean blankNodeLabelColonSeen;
@@ -95,8 +124,8 @@ public final class TurtleChunker {
 	private byte[] prefixBytes = new byte[PREFIX_BUFFER_INITIAL_SIZE];
 	private int prefixSize;
 
-	private OutputStream currentOutput;
-	private OutputStream blankNodeOutput;
+	private FastOutput currentOutput;
+	private FastOutput blankNodeOutput;
 	private Path currentChunkPath;
 	private Path blankNodeChunkPath;
 	private long currentChunkStartedMillis;
@@ -118,8 +147,13 @@ public final class TurtleChunker {
 		if (bufferSize <= 0) {
 			throw new IllegalArgumentException("Buffer size must be greater than zero");
 		}
+		if (bufferSize == Integer.MAX_VALUE) {
+			throw new IllegalArgumentException("Buffer size is too large");
+		}
 		this.in = in;
-		chunkBuf = new byte[bufferSize];
+		readLimit = bufferSize;
+		chunkBuf = new byte[bufferSize + 1];
+		chunkBuf[0] = ' ';
 	}
 
 	public static int writeChunks(Path inputFile, long approximateChunkSizeBytes, Path outputDir) throws IOException {
@@ -189,10 +223,7 @@ public final class TurtleChunker {
 
 		IOException failure = null;
 		try {
-			while (nextBlock()) {
-				writeBlock();
-				clearBlock();
-			}
+			parseAll();
 		} catch (IOException e) {
 			failure = e;
 		} finally {
@@ -211,7 +242,7 @@ public final class TurtleChunker {
 		}
 	}
 
-	static void main(String[] args) {
+	public static void main(String[] args) {
 		if (args.length < 2 || args.length > 3) {
 			printUsage();
 			System.exit(1);
@@ -244,48 +275,67 @@ public final class TurtleChunker {
 		}
 	}
 
-	private boolean nextBlock() throws IOException {
+	private void parseAll() throws IOException {
 		while (true) {
 			if (bufPos >= bufLen) {
 				readMoreData();
 			}
 
 			if (bufLen == 0) {
-				return emitLeftoverAtEof();
+				emitLeftoverAtEof();
+				return;
 			}
 
-			STATE_HANDLERS[state].handle(this);
-
-			if (pendingBytes != null && emitPending()) {
-				return true;
+			if (state == DEFAULT) {
+				parseDefaultRun();
+			} else {
+				parseNonDefaultOneStep();
 			}
+		}
+	}
+
+	private void parseNonDefaultOneStep() throws IOException {
+		int s = state;
+		if (s == IRI) {
+			parseIriOneStep();
+		} else if (s == LITERAL) {
+			parseLiteralOneStep();
+		} else if (s == MULTILINE_LITERAL) {
+			parseMultilineLiteralOneStep();
+		} else if (s == CONSUME_WHITESPACE) {
+			parseConsumeWhitespaceOneStep();
+		} else if (s == COMMENT) {
+			parseCommentOneStep();
+		} else if (s == PERIOD_PENDING) {
+			parsePeriodOneStep();
+		} else if (s == BLANK_NODE_LABEL) {
+			parseBlankNodeLabelOneStep();
+		} else if (s == PREFIX_OR_BASE) {
+			parsePrefixOrBaseOneStep();
+		} else if (s == GRAPH_BLOCK_CLOSED) {
+			parseGraphBlockClosedOneStep();
+		} else if (s == LANG_TAG_OR_DATATYPE) {
+			parseLangTagOrDatatypeOneStep();
+		} else if (s == QUOTE_START) {
+			parseQuoteStartOneStep();
+		} else if (s == QUOTE_START_SECOND) {
+			parseQuoteStartSecondOneStep();
+		} else {
+			throw new TurtleSyntaxException();
 		}
 	}
 
 	private void parseDefaultRun() throws IOException {
 		byte[] buf = chunkBuf;
+		byte[] actions = DEFAULT_BYTE_ACTIONS;
 		int p = bufPos;
 		int len = bufLen;
 
-		while (p < len) {
+		while (true) {
 			int runStart = p;
 			int c;
-			DefaultByteHandler handler;
-			while (true) {
-				if (p >= len) {
-					if (p > runStart) {
-						seenNonIgnorableInBlock = true;
-						nextDefaultByteAtTokenBoundary = false;
-					}
-					bufPos = p;
-					return;
-				}
-
-				c = buf[p] & 0xff;
-				handler = DEFAULT_BYTE_HANDLERS[c];
-				if (handler != null) {
-					break;
-				}
+			int action;
+			while ((action = actions[c = buf[p] & 0xff]) == DEFAULT_ACTION_ORDINARY) {
 				p++;
 			}
 
@@ -294,34 +344,118 @@ public final class TurtleChunker {
 				nextDefaultByteAtTokenBoundary = false;
 			}
 
-			boolean tokenBoundaryBeforeByte = nextDefaultByteAtTokenBoundary;
-			bufPos = p + 1;
-			handler.handle(this, c, tokenBoundaryBeforeByte);
-
-			if (state != DEFAULT || pendingBytes != null) {
+			if (p >= len) {
+				bufPos = len;
 				return;
 			}
 
-			buf = chunkBuf;
+			boolean tokenBoundaryBeforeByte = nextDefaultByteAtTokenBoundary;
+			p++;
+			bufPos = p;
+
+			if (action == DEFAULT_ACTION_WHITESPACE) {
+				p = skipTurtleWhitespace(buf, p, len);
+				bufPos = p;
+				nextDefaultByteAtTokenBoundary = true;
+			} else if (action == DEFAULT_ACTION_PERIOD) {
+				seenNonIgnorableInBlock = true;
+				nextDefaultByteAtTokenBoundary = false;
+				if (nestingDepth == 0) {
+					if (p >= len) {
+						state = PERIOD_PENDING;
+						return;
+					}
+					if (isTurtleWhitespace(buf[p] & 0xff)) {
+						emitCurrentBlock();
+						return;
+					}
+				}
+			} else if (action == DEFAULT_ACTION_IRI) {
+				seenNonIgnorableInBlock = true;
+				nextDefaultByteAtTokenBoundary = false;
+				state = IRI;
+				return;
+			} else if (action == DEFAULT_ACTION_QUOTE) {
+				seenNonIgnorableInBlock = true;
+				nextDefaultByteAtTokenBoundary = false;
+				startLiteral((byte) c);
+				return;
+			} else if (action == DEFAULT_ACTION_TOKEN_BOUNDARY) {
+				seenNonIgnorableInBlock = true;
+				nextDefaultByteAtTokenBoundary = true;
+			} else if (action == DEFAULT_ACTION_COMMENT) {
+				nextDefaultByteAtTokenBoundary = false;
+				state = COMMENT;
+				return;
+			} else if (action == DEFAULT_ACTION_BACKSLASH) {
+				seenNonIgnorableInBlock = true;
+				nextDefaultByteAtTokenBoundary = false;
+				if (p < len) {
+					bufPos = p + 1;
+				} else {
+					skipEscapedByteInDefault();
+				}
+			} else if (action == DEFAULT_ACTION_UNDERSCORE) {
+				seenNonIgnorableInBlock = true;
+				nextDefaultByteAtTokenBoundary = false;
+				if (tokenBoundaryBeforeByte) {
+					blankNodeLabelColonSeen = false;
+					state = BLANK_NODE_LABEL;
+					return;
+				}
+			} else if (action == DEFAULT_ACTION_DIRECTIVE) {
+				if (seenNonIgnorableInBlock) {
+					throw new TurtleSyntaxException();
+				}
+				seenNonIgnorableInBlock = true;
+				currentBlockIsPrefixOrBase = true;
+				nextDefaultByteAtTokenBoundary = false;
+				state = PREFIX_OR_BASE;
+				return;
+			} else if (action == DEFAULT_ACTION_OPEN_PAREN) {
+				seenNonIgnorableInBlock = true;
+				pushNesting((byte) '(');
+				nextDefaultByteAtTokenBoundary = true;
+			} else if (action == DEFAULT_ACTION_OPEN_BRACKET) {
+				seenNonIgnorableInBlock = true;
+				pushNesting((byte) '[');
+				nextDefaultByteAtTokenBoundary = true;
+			} else if (action == DEFAULT_ACTION_CLOSE_PAREN || action == DEFAULT_ACTION_CLOSE_BRACKET) {
+				seenNonIgnorableInBlock = true;
+				popNesting();
+				nextDefaultByteAtTokenBoundary = false;
+			} else if (action == DEFAULT_ACTION_OPEN_GRAPH) {
+				seenNonIgnorableInBlock = true;
+				if (nestingDepth == 0) {
+					startGraphBlock();
+				} else {
+					nextDefaultByteAtTokenBoundary = false;
+				}
+			} else if (action == DEFAULT_ACTION_CLOSE_GRAPH) {
+				if (inGraphBlock && nestingDepth == 0) {
+					if (seenNonIgnorableInBlock) {
+						throw new TurtleSyntaxException();
+					}
+					closeGraphBlock();
+					return;
+				}
+				seenNonIgnorableInBlock = true;
+				nextDefaultByteAtTokenBoundary = false;
+			}
+
 			p = bufPos;
 			len = bufLen;
 		}
-
-		bufPos = p;
 	}
 
 	private void parseIriOneStep() {
-		byte[] buf = chunkBuf;
-		int p = bufPos;
-		int len = bufLen;
-		while (p < len) {
-			if (buf[p++] == '>') {
-				bufPos = p;
-				state = DEFAULT;
-				return;
-			}
+		int p = findByte(chunkBuf, bufPos, bufLen, GREATER_THAN_WORD, '>');
+		if (p < bufLen) {
+			bufPos = p + 1;
+			state = DEFAULT;
+		} else {
+			bufPos = p;
 		}
-		bufPos = p;
 	}
 
 	private void parseQuoteStartOneStep() {
@@ -342,28 +476,36 @@ public final class TurtleChunker {
 		}
 	}
 
-	private void parseLiteralOneStep() {
+	private void parseLiteralOneStep() throws IOException {
 		byte[] buf = chunkBuf;
 		int p = bufPos;
 		int len = bufLen;
-		byte delimiter = literalDelimiter;
+		int delimiter = literalDelimiter & 0xff;
+		long delimiterWord = repeatedByte(delimiter);
 		int slashParity = consecutiveBackslashes & 1;
 
 		while (p < len) {
-			byte b = buf[p++];
-			if (b == '\\') {
-				slashParity ^= 1;
-				continue;
+			int special = findLiteralSpecial(buf, p, len, delimiterWord, delimiter);
+			if (special > p) {
+				slashParity = 0;
+			}
+			if (special >= len) {
+				bufPos = len;
+				consecutiveBackslashes = slashParity;
+				return;
 			}
 
-			boolean escaped = slashParity != 0;
-			slashParity = 0;
-
-			if (b == delimiter && !escaped) {
+			int c = buf[special] & 0xff;
+			p = special + 1;
+			if (c == '\\') {
+				slashParity ^= 1;
+			} else if (slashParity == 0) {
 				bufPos = p;
 				consecutiveBackslashes = 0;
-				state = LANG_TAG_OR_DATATYPE;
+				finishLiteral();
 				return;
+			} else {
+				slashParity = 0;
 			}
 		}
 
@@ -375,34 +517,83 @@ public final class TurtleChunker {
 		byte[] buf = chunkBuf;
 		int p = bufPos;
 		int len = bufLen;
-		byte delimiter = literalDelimiter;
+		int delimiter = literalDelimiter & 0xff;
+		long delimiterWord = repeatedByte(delimiter);
 		int slashParity = consecutiveBackslashes & 1;
 
 		while (p < len) {
-			byte b = buf[p++];
-			if (b == '\\') {
+			int special = findLiteralSpecial(buf, p, len, delimiterWord, delimiter);
+			if (special > p) {
+				slashParity = 0;
+			}
+			if (special >= len) {
+				bufPos = len;
+				consecutiveBackslashes = slashParity;
+				return;
+			}
+
+			int c = buf[special] & 0xff;
+			p = special + 1;
+			if (c == '\\') {
 				slashParity ^= 1;
 				continue;
 			}
 
-			boolean escaped = slashParity != 0;
-			slashParity = 0;
-
-			if (b == delimiter && !escaped) {
+			if (slashParity == 0) {
 				bufPos = p;
 				consecutiveBackslashes = 0;
-				if (checkForTripleQuote(delimiter)) {
-					state = LANG_TAG_OR_DATATYPE;
+				if (checkForTripleQuote((byte) delimiter)) {
+					finishLiteral();
 					return;
 				}
 				buf = chunkBuf;
 				p = bufPos;
 				len = bufLen;
+			} else {
+				slashParity = 0;
 			}
 		}
 
 		bufPos = p;
 		consecutiveBackslashes = slashParity;
+	}
+
+	private void startLiteral(byte delimiter) throws IOException {
+		literalDelimiter = delimiter;
+		consecutiveBackslashes = 0;
+
+		if (bufPos >= bufLen) {
+			readMoreData();
+		}
+		if (bufPos >= bufLen || chunkBuf[bufPos] != delimiter) {
+			state = LITERAL;
+			return;
+		}
+
+		bufPos++;
+		if (bufPos >= bufLen) {
+			readMoreData();
+		}
+		if (bufPos >= bufLen || chunkBuf[bufPos] != delimiter) {
+			finishLiteral();
+			return;
+		}
+
+		bufPos++;
+		state = MULTILINE_LITERAL;
+	}
+
+	private void finishLiteral() throws IOException {
+		if (bufPos >= bufLen) {
+			readMoreData();
+		}
+		if (bufPos < bufLen) {
+			byte b = chunkBuf[bufPos];
+			if (b == '@' || b == '^') {
+				bufPos++;
+			}
+		}
+		state = DEFAULT;
 	}
 
 	private void parseLangTagOrDatatypeOneStep() {
@@ -435,19 +626,14 @@ public final class TurtleChunker {
 	}
 
 	private void parseCommentOneStep() {
-		byte[] buf = chunkBuf;
-		int p = bufPos;
-		int len = bufLen;
-		while (p < len) {
-			byte b = buf[p++];
-			if (b == '\n' || b == '\r') {
-				bufPos = p;
-				nextDefaultByteAtTokenBoundary = true;
-				state = DEFAULT;
-				return;
-			}
+		int p = findEitherByte(chunkBuf, bufPos, bufLen, LF_WORD, '\n', CR_WORD, '\r');
+		if (p < bufLen) {
+			bufPos = p + 1;
+			nextDefaultByteAtTokenBoundary = true;
+			state = DEFAULT;
+		} else {
+			bufPos = p;
 		}
-		bufPos = p;
 	}
 
 	private void parseBlankNodeLabelOneStep() {
@@ -514,11 +700,11 @@ public final class TurtleChunker {
 		state = GRAPH_BLOCK_CLOSED;
 	}
 
-	private void parsePeriodOneStep() {
+	private void parsePeriodOneStep() throws IOException {
 		int next = chunkBuf[bufPos] & 0xff;
 		state = DEFAULT;
 		if (isTurtleWhitespace(next)) {
-			finalizeBlock();
+			emitCurrentBlock();
 		}
 	}
 
@@ -552,46 +738,38 @@ public final class TurtleChunker {
 		return true;
 	}
 
-	private void finalizeBlock() {
+	private void emitCurrentBlock() throws IOException {
+		byte[] bytes;
+		int offset;
+		int end;
+		boolean prefixOrBase = currentBlockIsPrefixOrBase;
+		boolean blankNodeLabel = currentBlockHasBlankNodeLabel;
+		byte[] graphHeader = inGraphBlock ? currentGraphHeader : null;
+
 		if (!multiReadBlock) {
 			int length = bufPos - chunkStart;
 			if (length <= 0) {
+				chunkStart = bufPos;
+				state = CONSUME_WHITESPACE;
+				resetBlockFlags();
 				return;
 			}
-			pendingBytes = chunkBuf;
-			pendingOffset = chunkStart;
-			pendingLength = length;
+			bytes = chunkBuf;
+			offset = chunkStart;
+			end = chunkStart + length;
 		} else {
 			if (bufPos > chunkStart) {
 				writePartial(chunkBuf, chunkStart, bufPos - chunkStart);
 			}
-			pendingLength = partialSize;
-			pendingBytes = detachPartialBytes();
-			pendingOffset = 0;
+			bytes = partialBytes;
+			offset = 0;
+			end = partialSize;
+			partialBytes = new byte[PARTIAL_BUFFER_INITIAL_SIZE];
+			partialSize = 0;
 			multiReadBlock = false;
 		}
 
-		pendingPrefixOrBase = currentBlockIsPrefixOrBase;
-		pendingBlankNodeLabel = currentBlockHasBlankNodeLabel;
-		pendingGraphHeader = inGraphBlock ? currentGraphHeader : null;
 		chunkStart = bufPos;
-	}
-
-	private boolean emitPending() {
-		byte[] bytes = pendingBytes;
-		int offset = pendingOffset;
-		int end = offset + pendingLength;
-		boolean prefixOrBase = pendingPrefixOrBase;
-		boolean blankNodeLabel = pendingBlankNodeLabel;
-		byte[] graphHeader = pendingGraphHeader;
-
-		pendingBytes = null;
-		pendingOffset = 0;
-		pendingLength = 0;
-		pendingPrefixOrBase = false;
-		pendingBlankNodeLabel = false;
-		pendingGraphHeader = null;
-
 		offset = skipTurtleWhitespace(bytes, offset, end);
 		end = trimTrailingTurtleWhitespace(bytes, offset, end);
 
@@ -599,37 +777,39 @@ public final class TurtleChunker {
 		resetBlockFlags();
 
 		int length = end - offset;
-		if (length <= 0) {
-			return false;
+		if (length > 0) {
+			writeBlock(bytes, offset, length, prefixOrBase, blankNodeLabel, graphHeader);
 		}
-
-		blockBytes = bytes;
-		blockOffset = offset;
-		blockLength = length;
-		blockPrefixOrBase = prefixOrBase;
-		blockBlankNodeLabel = blankNodeLabel;
-		blockGraphHeader = graphHeader;
-		return true;
 	}
 
-	private boolean emitLeftoverAtEof() {
+
+	private void emitLeftoverAtEof() throws IOException {
 		if (inGraphBlock) {
 			throw new TurtleSyntaxException();
 		}
 		if (!multiReadBlock && partialSize == 0) {
-			return false;
+			return;
 		}
 
-		pendingLength = partialSize;
-		pendingBytes = detachPartialBytes();
-		pendingOffset = 0;
-		pendingPrefixOrBase = currentBlockIsPrefixOrBase;
-		pendingBlankNodeLabel = currentBlockHasBlankNodeLabel;
-		pendingGraphHeader = null;
+		byte[] bytes = partialBytes;
+		int offset = 0;
+		int end = partialSize;
+		boolean prefixOrBase = currentBlockIsPrefixOrBase;
+		boolean blankNodeLabel = currentBlockHasBlankNodeLabel;
+
+		partialBytes = new byte[PARTIAL_BUFFER_INITIAL_SIZE];
+		partialSize = 0;
 		multiReadBlock = false;
 		chunkStart = 0;
 
-		return emitPending();
+		offset = skipTurtleWhitespace(bytes, offset, end);
+		end = trimTrailingTurtleWhitespace(bytes, offset, end);
+		resetBlockFlags();
+
+		int length = end - offset;
+		if (length > 0) {
+			writeBlock(bytes, offset, length, prefixOrBase, blankNodeLabel, null);
+		}
 	}
 
 	private void resetBlockFlags() {
@@ -678,10 +858,11 @@ public final class TurtleChunker {
 
 		int read;
 		do {
-			read = in.read(chunkBuf);
+			read = in.read(chunkBuf, 0, readLimit);
 		} while (read == 0);
 
 		bufLen = read < 0 ? 0 : read;
+		chunkBuf[bufLen] = ' ';
 	}
 
 	private void pushNesting(byte b) {
@@ -699,20 +880,17 @@ public final class TurtleChunker {
 		}
 	}
 
-	private void writeBlock() throws IOException {
-		if (blockPrefixOrBase) {
-			writePrefix(blockBytes, blockOffset, blockLength);
+	private void writeBlock(byte[] bytes, int offset, int length, boolean prefixOrBase,
+	                        boolean blankNodeLabel, byte[] graphHeader) throws IOException {
+		if (prefixOrBase) {
+			writePrefix(bytes, offset, length);
 			writePrefix('\n');
-			writeDirectiveToOpenChunks();
+			writeDirectiveToOpenChunks(bytes, offset, length);
 			return;
 		}
 
-		if (blockLength == 0) {
-			return;
-		}
-
-		if (blockBlankNodeLabel) {
-			writeBlankNodeStatement();
+		if (blankNodeLabel) {
+			writeBlankNodeStatement(bytes, offset, length, graphHeader);
 			return;
 		}
 
@@ -720,10 +898,9 @@ public final class TurtleChunker {
 			openNextChunk();
 		}
 
-		currentChunkBytes += switchCurrentGraph(blockGraphHeader);
-		currentOutput.write(blockBytes, blockOffset, blockLength);
-		currentOutput.write('\n');
-		currentChunkBytes += blockLength + 1L;
+		currentChunkBytes += switchCurrentGraph(graphHeader);
+		currentOutput.writeLine(bytes, offset, length);
+		currentChunkBytes += length + 1L;
 		statements++;
 
 		if (currentChunkBytes > approximateChunkSizeBytes) {
@@ -731,23 +908,21 @@ public final class TurtleChunker {
 		}
 	}
 
-	private void writeBlankNodeStatement() throws IOException {
+	private void writeBlankNodeStatement(byte[] bytes, int offset, int length, byte[] graphHeader) throws IOException {
 		if (blankNodeOutput == null) {
 			openBlankNodeChunk();
 		}
 
-		switchBlankNodeGraph(blockGraphHeader);
-		blankNodeOutput.write(blockBytes, blockOffset, blockLength);
-		blankNodeOutput.write('\n');
+		switchBlankNodeGraph(graphHeader);
+		blankNodeOutput.writeLine(bytes, offset, length);
 		statements++;
 	}
 
-	private void writeDirectiveToOpenChunks() throws IOException {
+	private void writeDirectiveToOpenChunks(byte[] bytes, int offset, int length) throws IOException {
 		if (currentOutput != null) {
 			currentChunkBytes += closeCurrentGraph();
-			currentOutput.write(blockBytes, blockOffset, blockLength);
-			currentOutput.write('\n');
-			currentChunkBytes += blockLength + 1L;
+			currentOutput.writeLine(bytes, offset, length);
+			currentChunkBytes += length + 1L;
 			if (currentChunkBytes > approximateChunkSizeBytes) {
 				closeCurrentOutput();
 			}
@@ -755,8 +930,7 @@ public final class TurtleChunker {
 
 		if (blankNodeOutput != null) {
 			closeBlankNodeGraph();
-			blankNodeOutput.write(blockBytes, blockOffset, blockLength);
-			blankNodeOutput.write('\n');
+			blankNodeOutput.writeLine(bytes, offset, length);
 		}
 	}
 
@@ -765,7 +939,7 @@ public final class TurtleChunker {
 		Path chunkPath = outputDir.resolve(formatChunkFileName(chunkIndex, chunkFileExtension));
 		currentChunkPath = chunkPath;
 		currentChunkStartedMillis = currentTimeMillis.getAsLong();
-		currentOutput = new BufferedOutputStream(Files.newOutputStream(chunkPath), BUFFER_SIZE);
+		currentOutput = new FastOutput(Files.newOutputStream(chunkPath), BUFFER_SIZE);
 		currentChunkBytes = writeChunkHeader(currentOutput);
 	}
 
@@ -774,11 +948,11 @@ public final class TurtleChunker {
 		Path chunkPath = outputDir.resolve(formatChunkFileName(chunkIndex, chunkFileExtension));
 		blankNodeChunkPath = chunkPath;
 		blankNodeChunkStartedMillis = currentTimeMillis.getAsLong();
-		blankNodeOutput = new BufferedOutputStream(Files.newOutputStream(chunkPath), BUFFER_SIZE);
+		blankNodeOutput = new FastOutput(Files.newOutputStream(chunkPath), BUFFER_SIZE);
 		writeChunkHeader(blankNodeOutput);
 	}
 
-	private long writeChunkHeader(OutputStream output) throws IOException {
+	private long writeChunkHeader(FastOutput output) throws IOException {
 		int length = trimTrailingTurtleWhitespace(prefixBytes, 0, prefixSize);
 		if (length == 0) {
 			return 0;
@@ -867,8 +1041,7 @@ public final class TurtleChunker {
 			return 0;
 		}
 
-		currentOutput.write('}');
-		currentOutput.write('\n');
+		currentOutput.write(CLOSE_GRAPH_BYTES);
 		currentOutputGraphHeader = null;
 		return 2L;
 	}
@@ -878,8 +1051,7 @@ public final class TurtleChunker {
 			return 0;
 		}
 
-		blankNodeOutput.write('}');
-		blankNodeOutput.write('\n');
+		blankNodeOutput.write(CLOSE_GRAPH_BYTES);
 		blankNodeOutputGraphHeader = null;
 		return 2L;
 	}
@@ -954,166 +1126,111 @@ public final class TurtleChunker {
 		return Arrays.copyOf(bytes, newCapacity);
 	}
 
-
-	@FunctionalInterface
-	private interface StateHandler {
-		void handle(TurtleChunker chunker) throws IOException;
+	private static Unsafe unsafe() {
+		try {
+			Field field = Unsafe.class.getDeclaredField("theUnsafe");
+			field.setAccessible(true);
+			return (Unsafe) field.get(null);
+		} catch (ReflectiveOperationException e) {
+			throw new ExceptionInInitializerError(e);
+		}
 	}
 
-	private static StateHandler[] stateHandlers() {
-		StateHandler[] handlers = new StateHandler[GRAPH_BLOCK_CLOSED + 1];
-		handlers[DEFAULT] = TurtleChunker::parseDefaultRun;
-		handlers[PERIOD_PENDING] = TurtleChunker::parsePeriodOneStep;
-		handlers[IRI] = TurtleChunker::parseIriOneStep;
-		handlers[LITERAL] = TurtleChunker::parseLiteralOneStep;
-		handlers[MULTILINE_LITERAL] = TurtleChunker::parseMultilineLiteralOneStep;
-		handlers[LANG_TAG_OR_DATATYPE] = TurtleChunker::parseLangTagOrDatatypeOneStep;
-		handlers[PREFIX_OR_BASE] = TurtleChunker::parsePrefixOrBaseOneStep;
-		handlers[CONSUME_WHITESPACE] = TurtleChunker::parseConsumeWhitespaceOneStep;
-		handlers[COMMENT] = TurtleChunker::parseCommentOneStep;
-		handlers[QUOTE_START] = TurtleChunker::parseQuoteStartOneStep;
-		handlers[QUOTE_START_SECOND] = TurtleChunker::parseQuoteStartSecondOneStep;
-		handlers[BLANK_NODE_LABEL] = TurtleChunker::parseBlankNodeLabelOneStep;
-		handlers[GRAPH_BLOCK_CLOSED] = TurtleChunker::parseGraphBlockClosedOneStep;
-		return handlers;
+	private static int findByte(byte[] bytes, int offset, int end, long repeatedTarget, int target) {
+		int limit = end - Long.BYTES;
+		while (offset <= limit) {
+			long word = UNSAFE.getLong(bytes, BYTE_ARRAY_BASE_OFFSET + offset);
+			long mask = zeroByteMask(word ^ repeatedTarget);
+			if (mask != 0L) {
+				return offset + (Long.numberOfTrailingZeros(mask) >>> 3);
+			}
+			offset += Long.BYTES;
+		}
+		while (offset < end) {
+			if ((bytes[offset] & 0xff) == target) {
+				return offset;
+			}
+			offset++;
+		}
+		return end;
 	}
 
-	@FunctionalInterface
-	private interface DefaultByteHandler {
-		void handle(TurtleChunker chunker, int c, boolean tokenBoundaryBeforeByte) throws IOException;
+	private static int findEitherByte(byte[] bytes, int offset, int end,
+	                                  long firstWord, int first,
+	                                  long secondWord, int second) {
+		int limit = end - Long.BYTES;
+		while (offset <= limit) {
+			long word = UNSAFE.getLong(bytes, BYTE_ARRAY_BASE_OFFSET + offset);
+			long mask = zeroByteMask(word ^ firstWord) | zeroByteMask(word ^ secondWord);
+			if (mask != 0L) {
+				return offset + (Long.numberOfTrailingZeros(mask) >>> 3);
+			}
+			offset += Long.BYTES;
+		}
+		while (offset < end) {
+			int c = bytes[offset] & 0xff;
+			if (c == first || c == second) {
+				return offset;
+			}
+			offset++;
+		}
+		return end;
 	}
 
-	private static DefaultByteHandler[] defaultByteHandlers() {
-		DefaultByteHandler whitespaceHandler = (chunker, c, tokenBoundaryBeforeByte) -> {
-			chunker.bufPos = skipTurtleWhitespace(chunker.chunkBuf, chunker.bufPos, chunker.bufLen);
-			chunker.nextDefaultByteAtTokenBoundary = true;
-		};
-
-		DefaultByteHandler quoteHandler = (chunker, c, tokenBoundaryBeforeByte) -> {
-			chunker.seenNonIgnorableInBlock = true;
-			chunker.literalDelimiter = (byte) c;
-			chunker.nextDefaultByteAtTokenBoundary = false;
-			chunker.state = QUOTE_START;
-		};
-
-		DefaultByteHandler[] handlers = new DefaultByteHandler[256];
-
-		handlers[' '] = whitespaceHandler;
-		handlers['\t'] = whitespaceHandler;
-		handlers['\n'] = whitespaceHandler;
-		handlers['\r'] = whitespaceHandler;
-
-		handlers['<'] = (chunker, c, tokenBoundaryBeforeByte) -> {
-			chunker.seenNonIgnorableInBlock = true;
-			chunker.nextDefaultByteAtTokenBoundary = false;
-			chunker.state = IRI;
-		};
-
-		handlers['#'] = (chunker, c, tokenBoundaryBeforeByte) -> {
-			chunker.nextDefaultByteAtTokenBoundary = false;
-			chunker.state = COMMENT;
-		};
-
-		handlers['('] = (chunker, c, tokenBoundaryBeforeByte) -> {
-			chunker.seenNonIgnorableInBlock = true;
-			chunker.pushNesting((byte) '(');
-			chunker.nextDefaultByteAtTokenBoundary = true;
-		};
-
-		handlers[')'] = (chunker, c, tokenBoundaryBeforeByte) -> {
-			chunker.seenNonIgnorableInBlock = true;
-			chunker.popNesting();
-			chunker.nextDefaultByteAtTokenBoundary = false;
-		};
-
-		handlers['['] = (chunker, c, tokenBoundaryBeforeByte) -> {
-			chunker.seenNonIgnorableInBlock = true;
-			chunker.pushNesting((byte) '[');
-			chunker.nextDefaultByteAtTokenBoundary = true;
-		};
-
-		handlers[']'] = (chunker, c, tokenBoundaryBeforeByte) -> {
-			chunker.seenNonIgnorableInBlock = true;
-			chunker.popNesting();
-			chunker.nextDefaultByteAtTokenBoundary = false;
-		};
-
-		handlers['{'] = (chunker, c, tokenBoundaryBeforeByte) -> {
-			chunker.seenNonIgnorableInBlock = true;
-			if (chunker.nestingDepth == 0) {
-				chunker.startGraphBlock();
-				return;
+	private static int findLiteralSpecial(byte[] bytes, int offset, int end,
+	                                      long delimiterWord, int delimiter) {
+		int limit = end - Long.BYTES;
+		while (offset <= limit) {
+			long word = UNSAFE.getLong(bytes, BYTE_ARRAY_BASE_OFFSET + offset);
+			long mask = zeroByteMask(word ^ delimiterWord) | zeroByteMask(word ^ BACKSLASH_WORD);
+			if (mask != 0L) {
+				return offset + (Long.numberOfTrailingZeros(mask) >>> 3);
 			}
-			chunker.nextDefaultByteAtTokenBoundary = false;
-		};
-
-		handlers['}'] = (chunker, c, tokenBoundaryBeforeByte) -> {
-			if (chunker.inGraphBlock && chunker.nestingDepth == 0) {
-				if (chunker.seenNonIgnorableInBlock) {
-					throw new TurtleSyntaxException();
-				}
-				chunker.closeGraphBlock();
-				return;
+			offset += Long.BYTES;
+		}
+		while (offset < end) {
+			int c = bytes[offset] & 0xff;
+			if (c == delimiter || c == '\\') {
+				return offset;
 			}
-			chunker.seenNonIgnorableInBlock = true;
-			chunker.nextDefaultByteAtTokenBoundary = false;
-		};
+			offset++;
+		}
+		return end;
+	}
 
-		handlers['\''] = quoteHandler;
-		handlers['"'] = quoteHandler;
+	private static long zeroByteMask(long word) {
+		return (word - BYTE_LOW_BITS) & ~word & BYTE_HIGH_BITS;
+	}
 
-		handlers['.'] = (chunker, c, tokenBoundaryBeforeByte) -> {
-			chunker.seenNonIgnorableInBlock = true;
-			chunker.nextDefaultByteAtTokenBoundary = false;
-			if (chunker.nestingDepth != 0) {
-				return;
-			}
-			if (chunker.bufPos >= chunker.bufLen) {
-				chunker.state = PERIOD_PENDING;
-				return;
-			}
-			if (isTurtleWhitespace(chunker.chunkBuf[chunker.bufPos] & 0xff)) {
-				chunker.finalizeBlock();
-			}
-		};
+	private static long repeatedByte(int b) {
+		return (b & 0xffL) * BYTE_LOW_BITS;
+	}
 
-		handlers['\\'] = (chunker, c, tokenBoundaryBeforeByte) -> {
-			chunker.seenNonIgnorableInBlock = true;
-			chunker.nextDefaultByteAtTokenBoundary = false;
-			if (chunker.bufPos < chunker.bufLen) {
-				chunker.bufPos++;
-			} else {
-				chunker.skipEscapedByteInDefault();
-			}
-		};
+	private static byte[] defaultByteActions() {
+		byte[] actions = new byte[256];
 
-		handlers['_'] = (chunker, c, tokenBoundaryBeforeByte) -> {
-			chunker.seenNonIgnorableInBlock = true;
-			chunker.nextDefaultByteAtTokenBoundary = false;
-			if (tokenBoundaryBeforeByte) {
-				chunker.blankNodeLabelColonSeen = false;
-				chunker.state = BLANK_NODE_LABEL;
-			}
-		};
+		actions[0x20] = DEFAULT_ACTION_WHITESPACE; // ' '
+		actions[0x09] = DEFAULT_ACTION_WHITESPACE; // '\t'
+		actions[0x0A] = DEFAULT_ACTION_WHITESPACE; // '\n'
+		actions[0x0D] = DEFAULT_ACTION_WHITESPACE; // '\r'
+		actions[0x2C] = DEFAULT_ACTION_TOKEN_BOUNDARY; // ','
+		actions[0x3B] = DEFAULT_ACTION_TOKEN_BOUNDARY; // ';'
+		actions[0x3C] = DEFAULT_ACTION_IRI; // '<'
+		actions[0x23] = DEFAULT_ACTION_COMMENT; // '#'
+		actions[0x28] = DEFAULT_ACTION_OPEN_PAREN; // '('
+		actions[0x29] = DEFAULT_ACTION_CLOSE_PAREN; // ')'
+		actions[0x5B] = DEFAULT_ACTION_OPEN_BRACKET; // '['
+		actions[0x5D] = DEFAULT_ACTION_CLOSE_BRACKET; // ']'
+		actions[0x7B] = DEFAULT_ACTION_OPEN_GRAPH; // '{'
+		actions[0x7D] = DEFAULT_ACTION_CLOSE_GRAPH; // '}'
+		actions[0x27] = DEFAULT_ACTION_QUOTE; // '\''
+		actions[0x22] = DEFAULT_ACTION_QUOTE; // '"'
+		actions[0x2E] = DEFAULT_ACTION_PERIOD; // '.'
+		actions[0x5C] = DEFAULT_ACTION_BACKSLASH; // '\\'
+		actions[0x5F] = DEFAULT_ACTION_UNDERSCORE; // '_'
+		actions[0x40] = DEFAULT_ACTION_DIRECTIVE; // '@'
 
-		handlers['@'] = (chunker, c, tokenBoundaryBeforeByte) -> {
-			if (chunker.seenNonIgnorableInBlock) {
-				throw new TurtleSyntaxException();
-			}
-			chunker.seenNonIgnorableInBlock = true;
-			chunker.currentBlockIsPrefixOrBase = true;
-			chunker.nextDefaultByteAtTokenBoundary = false;
-			chunker.state = PREFIX_OR_BASE;
-		};
-
-		DefaultByteHandler boundaryHandler = (chunker, c, tokenBoundaryBeforeByte) -> {
-			chunker.seenNonIgnorableInBlock = true;
-			chunker.nextDefaultByteAtTokenBoundary = true;
-		};
-		handlers[','] = boundaryHandler;
-		handlers[';'] = boundaryHandler;
-
-		return handlers;
+		return actions;
 	}
 
 	static long parseChunkSize(String rawValue) {
@@ -1349,6 +1466,105 @@ public final class TurtleChunker {
 	private static void printUsage() {
 		System.err.println("Usage: java -jar target/ttl-chunker-1.0-SNAPSHOT.jar <input.ttl|input.trig> <chunk-size> [output-dir]");
 		System.err.println("Chunk size examples: 50000000, 64KB, 128MB, 2GB");
+	}
+
+	private static final class FastOutput implements AutoCloseable {
+		private final OutputStream out;
+		private final byte[] buffer;
+		private int position;
+
+		FastOutput(OutputStream out, int bufferSize) {
+			if (out == null) {
+				throw new NullPointerException();
+			}
+			this.out = out;
+			this.buffer = new byte[bufferSize];
+		}
+
+		void write(int b) throws IOException {
+			int p = position;
+			if (p == buffer.length) {
+				flushBuffer();
+				p = 0;
+			}
+			buffer[p] = (byte) b;
+			position = p + 1;
+		}
+
+		void write(byte[] source) throws IOException {
+			write(source, 0, source.length);
+		}
+
+		void write(byte[] source, int offset, int length) throws IOException {
+			if (length <= 0) {
+				return;
+			}
+
+			byte[] buf = buffer;
+			int p = position;
+			int available = buf.length - p;
+			if (length <= available) {
+				System.arraycopy(source, offset, buf, p, length);
+				position = p + length;
+				return;
+			}
+
+			if (p != 0) {
+				flushBuffer();
+			}
+
+			if (length >= buf.length) {
+				out.write(source, offset, length);
+			} else {
+				System.arraycopy(source, offset, buf, 0, length);
+				position = length;
+			}
+		}
+
+		void writeLine(byte[] source, int offset, int length) throws IOException {
+			byte[] buf = buffer;
+			int p = position;
+			int total = length + 1;
+			if (total > 0 && total <= buf.length - p) {
+				System.arraycopy(source, offset, buf, p, length);
+				p += length;
+				buf[p] = '\n';
+				position = p + 1;
+				return;
+			}
+			write(source, offset, length);
+			write('\n');
+		}
+
+		private void flushBuffer() throws IOException {
+			int p = position;
+			if (p != 0) {
+				out.write(buffer, 0, p);
+				position = 0;
+			}
+		}
+
+		@Override
+		public void close() throws IOException {
+			IOException failure = null;
+			try {
+				flushBuffer();
+			} catch (IOException e) {
+				failure = e;
+			}
+			try {
+				out.close();
+			} catch (IOException e) {
+				if (failure == null) {
+					failure = e;
+				} else {
+					failure.addSuppressed(e);
+				}
+			}
+			if (failure != null) {
+				throw failure;
+			}
+		}
 	}
 
 	public static final class TurtleSyntaxException extends RuntimeException {

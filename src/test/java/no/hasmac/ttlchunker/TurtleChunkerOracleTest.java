@@ -43,44 +43,8 @@ class TurtleChunkerOracleTest {
 
 	private static Stream<Fixture> fixtures() {
 		return Stream.of(
-				new Fixture("turtle-rich", "input.ttl", turtleRichInput(), RDFFormat.TURTLE),
-				new Fixture("trig-rich", "input.trig", trigRichInput(), RDFFormat.TRIG));
-	}
-
-	private static String turtleRichInput() {
-		return """
-				@prefix ex: <http://example.com/> .
-				@prefix foaf: <http://xmlns.com/foaf/0.1/> .
-				@base <http://example.com/base/> .
-				# comment with . and } ignored
-				ex:s1 ex:p "literal with . and { brace }" ;
-				      ex:q <http://example.com/has%7Bbrace%7D> ;
-				      foaf:name "Name"@en .
-				<relativeSubject> ex:list ( "one" "two" ex:item ) ;
-				                  ex:many ex:o1, ex:o2 ;
-				                  ex:multi '''line one
-				line two . } still literal''' .
-				_:shared ex:p "blank subject" .
-				ex:usesBlank ex:p _:shared .
-				""";
-	}
-
-	private static String trigRichInput() {
-		return """
-				@prefix ex: <http://example.com/> .
-				{
-				  ex:default ex:p "default" .
-				}
-				ex:g1 {
-				  ex:named ex:p "named" .
-				  ex:named ex:list ( ex:a ex:b ) .
-				}
-				GRAPH ex:g2 {
-				  _:shared ex:p "one" .
-				  ex:named ex:link _:shared .
-				}
-				ex:top ex:p "top-level default" .
-				""";
+				new Fixture("turtle-rich", "input.ttl", RdfTestSupport.turtleRichInput(), RDFFormat.TURTLE),
+				new Fixture("trig-rich", "input.trig", RdfTestSupport.trigRichInput(), RDFFormat.TRIG));
 	}
 
 	private record Fixture(String name, String fileName, String input, RDFFormat format) {

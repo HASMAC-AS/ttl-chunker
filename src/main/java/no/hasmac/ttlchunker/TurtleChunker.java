@@ -84,6 +84,7 @@ public final class TurtleChunker {
 	private int bufPos;
 	private int bufLen;
 	private int chunkStart;
+	private boolean firstBuffer = true;
 
 	private boolean multiReadBlock;
 	private boolean currentBlockIsPrefixOrBase;
@@ -97,6 +98,8 @@ public final class TurtleChunker {
 	private int consecutiveBackslashes;
 	private boolean blankNodeLabelColonSeen;
 	private byte[] currentGraphHeader;
+	private boolean currentGraphHeaderHasBlankNodeLabel;
+	private boolean currentGraphHeaderIsAnonLabel;
 
 	private byte[] nestingStack = new byte[32];
 	private int nestingDepth;
@@ -152,7 +155,9 @@ public final class TurtleChunker {
 		}
 		this.in = in;
 		readLimit = bufferSize;
-		chunkBuf = new byte[bufferSize + 1];
+		// At least 3 bytes of capacity so a UTF-8 BOM can be detected even when the requested
+		// read size is smaller than the BOM.
+		chunkBuf = new byte[Math.max(bufferSize, 3) + 1];
 		chunkBuf[0] = ' ';
 	}
 
@@ -271,6 +276,9 @@ public final class TurtleChunker {
 		} catch (IOException e) {
 			System.err.print("Chunking failed: ");
 			System.err.println(e.getMessage());
+			System.exit(1);
+		} catch (TurtleSyntaxException e) {
+			System.err.println("Chunking failed: invalid Turtle/TriG syntax in input file");
 			System.exit(1);
 		}
 	}
@@ -405,7 +413,14 @@ public final class TurtleChunker {
 				}
 			} else if (action == DEFAULT_ACTION_DIRECTIVE) {
 				if (seenNonIgnorableInBlock) {
-					throw new TurtleSyntaxException();
+					// Dot-less SPARQL-style directives leave the block unterminated, so an
+					// '@'-directive can legitimately follow one in the same block. Emit the
+					// pending directives, then start a fresh block at the '@'.
+					if (!pendingBlockMayBeSparqlDirectives()) {
+						throw new TurtleSyntaxException();
+					}
+					emitBlockEndingAt(bufPos - 1);
+					chunkStart = bufPos - 1;
 				}
 				seenNonIgnorableInBlock = true;
 				currentBlockIsPrefixOrBase = true;
@@ -434,7 +449,8 @@ public final class TurtleChunker {
 			} else if (action == DEFAULT_ACTION_CLOSE_GRAPH) {
 				if (inGraphBlock && nestingDepth == 0) {
 					if (seenNonIgnorableInBlock) {
-						throw new TurtleSyntaxException();
+						// The final triple in a graph block may omit its '.' per the TriG grammar.
+						emitBlockEndingAt(bufPos - 1);
 					}
 					closeGraphBlock();
 					return;
@@ -679,11 +695,13 @@ public final class TurtleChunker {
 		}
 	}
 
-	private void startGraphBlock() {
+	private void startGraphBlock() throws IOException {
 		if (inGraphBlock) {
 			throw new TurtleSyntaxException();
 		}
-		currentGraphHeader = copyCurrentBlockTrimmed(bufPos);
+		currentGraphHeader = extractLeadingDirectivesFromGraphHeader(copyCurrentBlockTrimmed(bufPos));
+		currentGraphHeaderIsAnonLabel = isAnonGraphLabel(currentGraphHeader);
+		currentGraphHeaderHasBlankNodeLabel = currentBlockHasBlankNodeLabel || currentGraphHeaderIsAnonLabel;
 		inGraphBlock = true;
 		clearCurrentBlockBytes();
 		chunkStart = bufPos;
@@ -691,13 +709,76 @@ public final class TurtleChunker {
 		state = DEFAULT;
 	}
 
-	private void closeGraphBlock() {
+	private void closeGraphBlock() throws IOException {
+		// Each input graph block gets its own output wrap: a dot-less final triple is only valid
+		// directly before '}', so adjacent same-label blocks must not merge into one wrap — and
+		// '[]' blocks are distinct graphs that must never merge at all.
+		currentChunkBytes += closeCurrentGraph();
+		closeBlankNodeGraph();
 		inGraphBlock = false;
 		currentGraphHeader = null;
+		currentGraphHeaderHasBlankNodeLabel = false;
+		currentGraphHeaderIsAnonLabel = false;
 		clearCurrentBlockBytes();
 		chunkStart = bufPos;
 		resetBlockFlags();
 		state = GRAPH_BLOCK_CLOSED;
+	}
+
+	/**
+	 * A dot-less SPARQL-style directive (or a comment line) written directly before a graph label
+	 * is scanned into the same block as the label and would otherwise be captured into the graph
+	 * header. Peel directives off into the prefix store and drop the comments; what remains is
+	 * the real header (label + '{').
+	 */
+	private byte[] extractLeadingDirectivesFromGraphHeader(byte[] graphHeader) throws IOException {
+		int offset = 0;
+		int end = graphHeader.length;
+		while (true) {
+			offset = skipTurtleWhitespace(graphHeader, offset, end);
+			int probe = skipCommentLines(graphHeader, offset, end);
+			if (probe < end && startsLikeSparqlStyleDirective(graphHeader[probe])) {
+				int directiveEnd = sparqlStyleDirectiveEnd(graphHeader, probe, end);
+				if (directiveEnd >= 0) {
+					writePrefix(graphHeader, probe, directiveEnd - probe);
+					writePrefix('\n');
+					writeDirectiveToOpenChunks(graphHeader, probe, directiveEnd - probe);
+					offset = directiveEnd;
+					continue;
+				}
+			}
+			offset = probe;
+			break;
+		}
+		if (offset == 0) {
+			return graphHeader;
+		}
+		return Arrays.copyOfRange(graphHeader, skipTurtleWhitespace(graphHeader, offset, end), end);
+	}
+
+	private static int skipCommentLines(byte[] bytes, int offset, int end) {
+		while (offset < end && bytes[offset] == '#') {
+			while (offset < end && bytes[offset] != '\n' && bytes[offset] != '\r') {
+				offset++;
+			}
+			offset = skipTurtleWhitespace(bytes, offset, end);
+		}
+		return offset;
+	}
+
+	private static boolean isAnonGraphLabel(byte[] graphHeader) {
+		// The captured header ends with '{'. A graph label ends with ']' only for the ANON form
+		// ('[]' or '[ ]'): IRIs end with '>', prefixed names and blank node labels cannot end
+		// with ']'.
+		int i = graphHeader.length - 1;
+		if (i < 0 || graphHeader[i] != '{') {
+			return false;
+		}
+		i--;
+		while (i >= 0 && isTurtleWhitespace(graphHeader[i] & 0xff)) {
+			i--;
+		}
+		return i >= 0 && graphHeader[i] == ']';
 	}
 
 	private void parsePeriodOneStep() throws IOException {
@@ -739,6 +820,36 @@ public final class TurtleChunker {
 	}
 
 	private void emitCurrentBlock() throws IOException {
+		emitBlockEndingAt(bufPos);
+	}
+
+	/**
+	 * Cheap check whether the pending (unterminated) block could consist of dot-less SPARQL-style
+	 * directives, possibly preceded by comment lines: its first non-whitespace byte must be
+	 * 'p'/'b' (case-insensitive) or '#'. Only used off the hot path to decide between emitting
+	 * the pending block and rejecting a misplaced '@'.
+	 */
+	private boolean pendingBlockMayBeSparqlDirectives() {
+		byte[] bytes;
+		int offset;
+		int end;
+		if (multiReadBlock && partialSize > 0) {
+			bytes = partialBytes;
+			offset = 0;
+			end = partialSize;
+		} else {
+			bytes = chunkBuf;
+			offset = chunkStart;
+			end = bufPos - 1;
+		}
+		offset = skipTurtleWhitespace(bytes, offset, end);
+		if (offset >= end) {
+			return false;
+		}
+		return startsLikeSparqlStyleDirective(bytes[offset]) || bytes[offset] == '#';
+	}
+
+	private void emitBlockEndingAt(int endExclusive) throws IOException {
 		byte[] bytes;
 		int offset;
 		int end;
@@ -747,7 +858,7 @@ public final class TurtleChunker {
 		byte[] graphHeader = inGraphBlock ? currentGraphHeader : null;
 
 		if (!multiReadBlock) {
-			int length = bufPos - chunkStart;
+			int length = endExclusive - chunkStart;
 			if (length <= 0) {
 				chunkStart = bufPos;
 				state = CONSUME_WHITESPACE;
@@ -758,8 +869,8 @@ public final class TurtleChunker {
 			offset = chunkStart;
 			end = chunkStart + length;
 		} else {
-			if (bufPos > chunkStart) {
-				writePartial(chunkBuf, chunkStart, bufPos - chunkStart);
+			if (endExclusive > chunkStart) {
+				writePartial(chunkBuf, chunkStart, endExclusive - chunkStart);
 			}
 			bytes = partialBytes;
 			offset = 0;
@@ -814,7 +925,7 @@ public final class TurtleChunker {
 
 	private void resetBlockFlags() {
 		currentBlockIsPrefixOrBase = false;
-		currentBlockHasBlankNodeLabel = false;
+		currentBlockHasBlankNodeLabel = inGraphBlock && currentGraphHeaderHasBlankNodeLabel;
 		seenNonIgnorableInBlock = false;
 		nextDefaultByteAtTokenBoundary = true;
 		blankNodeLabelColonSeen = false;
@@ -862,6 +973,23 @@ public final class TurtleChunker {
 		} while (read == 0);
 
 		bufLen = read < 0 ? 0 : read;
+		if (firstBuffer) {
+			firstBuffer = false;
+			while (bufLen > 0 && bufLen < 3) {
+				int more = in.read(chunkBuf, bufLen, 3 - bufLen);
+				if (more < 0) {
+					break;
+				}
+				bufLen += more;
+			}
+			if (bufLen >= 3
+					&& (chunkBuf[0] & 0xff) == 0xEF
+					&& (chunkBuf[1] & 0xff) == 0xBB
+					&& (chunkBuf[2] & 0xff) == 0xBF) {
+				bufPos = 3;
+				chunkStart = 3;
+			}
+		}
 		chunkBuf[bufLen] = ' ';
 	}
 
@@ -882,6 +1010,32 @@ public final class TurtleChunker {
 
 	private void writeBlock(byte[] bytes, int offset, int length, boolean prefixOrBase,
 	                        boolean blankNodeLabel, byte[] graphHeader) throws IOException {
+		// Consecutive SPARQL-style directives share one block (they have no '.' terminator); peel
+		// them off iteratively so a directive-heavy block cannot overflow the stack. Detection
+		// looks past leading comment lines; comments are only dropped when a directive actually
+		// follows them, so comment-only blocks keep their current pass-through behavior.
+		while (!prefixOrBase) {
+			int end = offset + length;
+			int probe = skipCommentLines(bytes, offset, end);
+			if (probe >= end || !startsLikeSparqlStyleDirective(bytes[probe])) {
+				break;
+			}
+			int directiveEnd = sparqlStyleDirectiveEnd(bytes, probe, end);
+			if (directiveEnd < 0) {
+				break;
+			}
+			writePrefix(bytes, probe, directiveEnd - probe);
+			writePrefix('\n');
+			writeDirectiveToOpenChunks(bytes, probe, directiveEnd - probe);
+
+			int nextOffset = skipTurtleWhitespace(bytes, directiveEnd, end);
+			if (nextOffset >= end) {
+				return;
+			}
+			length = end - nextOffset;
+			offset = nextOffset;
+		}
+
 		if (prefixOrBase) {
 			writePrefix(bytes, offset, length);
 			writePrefix('\n');
@@ -1369,6 +1523,61 @@ public final class TurtleChunker {
 		return end;
 	}
 
+	private static int sparqlStyleDirectiveEnd(byte[] bytes, int offset, int end) {
+		int first = bytes[offset] | 0x20;
+		if (first == 'p') {
+			if (prefixKeywordAt(bytes, offset, end)) {
+				return directiveIriEnd(bytes, offset + 6, end);
+			}
+		} else if (first == 'b' && baseKeywordAt(bytes, offset, end)) {
+			return directiveIriEnd(bytes, offset + 4, end);
+		}
+		return -1;
+	}
+
+	private static boolean startsLikeSparqlStyleDirective(byte b) {
+		int c = b | 0x20;
+		return c == 'p' || c == 'b';
+	}
+
+	private static boolean prefixKeywordAt(byte[] bytes, int offset, int end) {
+		return end - offset > 6
+				&& asciiUpper((char) (bytes[offset] & 0xff)) == 'P'
+				&& asciiUpper((char) (bytes[offset + 1] & 0xff)) == 'R'
+				&& asciiUpper((char) (bytes[offset + 2] & 0xff)) == 'E'
+				&& asciiUpper((char) (bytes[offset + 3] & 0xff)) == 'F'
+				&& asciiUpper((char) (bytes[offset + 4] & 0xff)) == 'I'
+				&& asciiUpper((char) (bytes[offset + 5] & 0xff)) == 'X'
+				&& isTurtleWhitespace(bytes[offset + 6] & 0xff);
+	}
+
+	private static boolean baseKeywordAt(byte[] bytes, int offset, int end) {
+		// 'BASE<iri>' with no whitespace is valid (tokens need no separator); PREFIX keeps the
+		// whitespace requirement because 'PREFIXfoo:' is a legitimate prefixed name.
+		return end - offset > 4
+				&& asciiUpper((char) (bytes[offset] & 0xff)) == 'B'
+				&& asciiUpper((char) (bytes[offset + 1] & 0xff)) == 'A'
+				&& asciiUpper((char) (bytes[offset + 2] & 0xff)) == 'S'
+				&& asciiUpper((char) (bytes[offset + 3] & 0xff)) == 'E'
+				&& (isTurtleWhitespace(bytes[offset + 4] & 0xff) || bytes[offset + 4] == '<');
+	}
+
+	private static int directiveIriEnd(byte[] bytes, int offset, int end) {
+		// The directive ends at the closing '>' of its IRIREF, which cannot contain '>' or line
+		// breaks. Anything after it on the same line is a following statement, not directive.
+		int i = offset;
+		while (i < end && bytes[i] != '<') {
+			i++;
+		}
+		while (i < end) {
+			if (bytes[i] == '>') {
+				return i + 1;
+			}
+			i++;
+		}
+		return -1;
+	}
+
 	private static int trimTrailingTurtleWhitespace(byte[] bytes, int length) {
 		return trimTrailingTurtleWhitespace(bytes, 0, length);
 	}
@@ -1421,7 +1630,7 @@ public final class TurtleChunker {
 		output.print(millis);
 	}
 
-	private static String formatChunkFileName(int chunkIndex, String extension) {
+	static String formatChunkFileName(int chunkIndex, String extension) {
 		int digits = decimalDigits(chunkIndex);
 		int zeroes = Math.max(0, 5 - digits);
 		char[] chars = new char[6 + zeroes + digits + extension.length()];

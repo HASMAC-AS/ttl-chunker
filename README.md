@@ -82,9 +82,7 @@ ttl-chunker/
 ├── pom.xml                                          # Maven build descriptor
 └── src/
     ├── main/java/no/hasmac/ttlchunker/
-    │   ├── TurtleBlockReader.java                   # Streaming Turtle/TriG block reader
-    │   ├── ChunkSink.java                           # Chunk writer + graph wrapping
-    │   └── TurtleChunker.java                       # CLI + public facade
+    │   └── TurtleChunker.java                       # CLI, parser, chunk writer
     └── test/java/no/hasmac/ttlchunker/
         ├── benchmark/
         │   └── TurtleChunkerBenchmark.java          # JMH benchmark fixtures

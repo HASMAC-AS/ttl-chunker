@@ -1,0 +1,6 @@
+# Tests to skip, one per line: <test name><TAB><reason>
+# Reasons should be prefixed KNOWN-BUG: (chunker bug with a fix pending) or ORACLE: (RDF4J
+# cannot parse the original input). Excluded tests show up as skipped, never as silently
+# missing.
+rdf-trig/trig-syntax-number-08	ORACLE: RDF4J parses "{<s> <p> 123.}" as ill-typed decimal "123."; the chunker reads integer 123 + optional final dot, matching the test name "This is an integer"
+rdf-trig/trig-syntax-minimal-whitespace-01	ORACLE: RDF4J parses "_:o." before "}" as blank node label "o." but labels cannot end with a dot per the grammar; the chunker reads label "o" + statement dot, which is grammar-correct

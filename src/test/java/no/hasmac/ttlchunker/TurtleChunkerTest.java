@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static no.hasmac.ttlchunker.RdfTestSupport.listRegularFiles;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -11,10 +12,8 @@ import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Comparator;
 import java.util.List;
 import java.util.stream.Collectors;
-import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -51,13 +50,7 @@ class TurtleChunkerTest {
 		int chunkCount = TurtleChunker.writeChunks(inputFile, 80, outputDir);
 		assertTrue(chunkCount > 1, "Expected more than one output chunk");
 
-		List<Path> chunkFiles;
-		try (Stream<Path> paths = Files.list(outputDir)) {
-			chunkFiles = paths
-					.filter(Files::isRegularFile)
-					.sorted(Comparator.comparing(path -> path.getFileName().toString()))
-					.collect(Collectors.toList());
-		}
+		List<Path> chunkFiles = listRegularFiles(outputDir);
 
 		assertEquals(chunkCount, chunkFiles.size());
 		for (Path chunkFile : chunkFiles) {
@@ -85,13 +78,7 @@ class TurtleChunkerTest {
 		int chunkCount = TurtleChunker.writeChunks(inputFile, 1, outputDir);
 		assertTrue(chunkCount > 1, "Expected chunk size to force multiple output chunks");
 
-		List<Path> chunkFiles;
-		try (Stream<Path> paths = Files.list(outputDir)) {
-			chunkFiles = paths
-					.filter(Files::isRegularFile)
-					.sorted(Comparator.comparing(path -> path.getFileName().toString()))
-					.collect(Collectors.toList());
-		}
+		List<Path> chunkFiles = listRegularFiles(outputDir);
 
 		List<Path> blankNodeChunks = chunkFiles.stream()
 				.filter(path -> {
@@ -268,15 +255,6 @@ class TurtleChunkerTest {
 		String blankNodeChunk = Files.readString(blankNodeChunks.getFirst(), StandardCharsets.UTF_8);
 		assertTrue(blankNodeChunk.contains("ex:g1 {\n_:shared ex:first \"one\" .\n}\n"));
 		assertTrue(blankNodeChunk.contains("ex:g2 {\nex:s ex:link _:other .\n}\n"));
-	}
-
-	private static List<Path> listRegularFiles(Path outputDir) throws IOException {
-		try (Stream<Path> paths = Files.list(outputDir)) {
-			return paths
-					.filter(Files::isRegularFile)
-					.sorted(Comparator.comparing(path -> path.getFileName().toString()))
-					.collect(Collectors.toList());
-		}
 	}
 
 	private static int countOccurrences(String value, String needle) {
